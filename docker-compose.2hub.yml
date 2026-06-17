@@ -1,0 +1,63 @@
+# Two-hub federation example / local test. Brings up two independent hubs
+# (in-memory, no DB for simplicity) plus a probe attached to hub1, to show that
+# results, the check catalog, and the hub directory all converge across hubs.
+#
+# Usage (hub2 needs hub1's libp2p address, which hub1 prints on startup):
+#   docker compose -f docker-compose.2hub.yml up -d --build hub1
+#   ADDR=$(docker compose -f docker-compose.2hub.yml logs hub1 \
+#            | grep -o '/ip4/172[^ "]*/p2p/[A-Za-z0-9]*' | head -1)
+#   BOOTSTRAP_PEERS="$ADDR" docker compose -f docker-compose.2hub.yml up -d hub2 probe
+#
+# hub1 dashboard API: http://localhost:8080   hub2: http://localhost:8082
+name: libreping-2hub
+
+services:
+  hub1:
+    build: { context: ., dockerfile: hub/Dockerfile }
+    environment:
+      HTTP_ADDR: ":8080"
+      P2P_LISTEN: "/ip4/0.0.0.0/tcp/4001"
+      PUBLIC_URL: "http://hub1:8080"
+      HUB_NAME: "hub1"
+      ADVERTISE: "true"
+      ADVERTISE_INTERVAL: "10s"
+      CATALOG_GOSSIP_INTERVAL: "10s"
+      SEED_CHECK_TARGET: "https://example.com"
+      # These hubs reach each other over the private Docker network, so allow the
+      # directory reachability check to dial private addresses (off by default to
+      # block SSRF on public hubs).
+      HUB_ALLOW_PRIVATE_PEERS: "true"
+      HUB_KEY_PATH: "/data/hub.key"
+    volumes: [hub1data:/data]
+    ports: ["8080:8080"]
+
+  hub2:
+    build: { context: ., dockerfile: hub/Dockerfile }
+    environment:
+      HTTP_ADDR: ":8080"
+      P2P_LISTEN: "/ip4/0.0.0.0/tcp/4001"
+      PUBLIC_URL: "http://hub2:8080"
+      HUB_NAME: "hub2"
+      ADVERTISE: "true"
+      ADVERTISE_INTERVAL: "10s"
+      CATALOG_GOSSIP_INTERVAL: "10s"
+      BOOTSTRAP_PEERS: "${BOOTSTRAP_PEERS:-}"
+      HUB_ALLOW_PRIVATE_PEERS: "true"
+      HUB_KEY_PATH: "/data/hub.key"
+    volumes: [hub2data:/data]
+    ports: ["8082:8080"]
+
+  probe:
+    build: { context: ., dockerfile: probe/Dockerfile }
+    environment:
+      HUB_URL: "http://hub1:8080"
+      PROBE_LOCATION: "DE,Frankfurt,50.11,8.68"
+      MAX_CHECKS_PER_MINUTE: "60"
+      PROBE_KEY_PATH: "/data/probe.key"
+      POLL_INTERVAL: "10s"
+    volumes: [probedata:/data]
+
+volumes:
+  hub1data: {}
+  hub2data: {}
+  probedata: {}

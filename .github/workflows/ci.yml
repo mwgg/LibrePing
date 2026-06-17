@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [pkg, probe, hub]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+      - name: test
+        working-directory: ${{ matrix.module }}
+        run: go test ./...
+      - name: vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: install
+        working-directory: web
+        run: npm ci
+      - name: build
+        working-directory: web
+        run: npm run build

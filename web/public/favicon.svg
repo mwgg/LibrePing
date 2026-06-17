@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <style>
+    .wave { stroke: #173a5e; }
+    .emit { fill: #173a5e; }
+    .target { fill: #15803d; }
+    @media (prefers-color-scheme: dark) {
+      .wave { stroke: #8ab4f8; }
+      .emit { fill: #8ab4f8; }
+      .target { fill: #4ade80; }
+    }
+  </style>
+  <g class="wave" stroke-width="3.2" stroke-linecap="round">
+    <path d="M17 34 A13 13 0 0 1 30 47" stroke-opacity="1"/>
+    <path d="M17 25 A22 22 0 0 1 39 47" stroke-opacity="0.6"/>
+    <path d="M17 16 A31 31 0 0 1 48 47" stroke-opacity="0.34"/>
+  </g>
+  <circle class="target" cx="44" cy="20" r="4"/>
+  <circle class="emit" cx="17" cy="47" r="5"/>
+</svg>

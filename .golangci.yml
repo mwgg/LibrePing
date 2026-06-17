@@ -1,0 +1,22 @@
+# Baseline linters for LibrePing. Run `golangci-lint run` inside each module
+# (pkg/, probe/, hub/) or via `make lint`.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - misspell
+    - bodyclose
+
+issues:
+  exclude-rules:
+    # Test files may ignore errors on best-effort calls.
+    - path: _test\.go
+      linters:
+        - errcheck

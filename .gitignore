@@ -1,0 +1,21 @@
+# Build artifacts
+/bin/
+hub/hub
+probe/probe
+*.exe
+
+# Node
+web/node_modules/
+web/dist/
+
+# Runtime data (identity keys, sqlite, etc.)
+data/
+*.key
+
+# Local env
+.env
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/

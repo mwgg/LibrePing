@@ -1,0 +1,111 @@
+# Full HUB node: a publicly-reachable hub + its database + dashboard + a local
+# probe. This is what you run to host your own corner of the LibrePing mesh.
+#
+#   docker compose up --build
+#
+# Dashboard: http://localhost:8081   API: http://localhost:8080
+# To join peer hubs, set BOOTSTRAP_PEERS (see .env.example).
+name: libreping
+
+services:
+  timescaledb:
+    # Pinned (not :latest-pg16) so a rebuild can't silently change the database
+    # engine under a running deployment. Bump deliberately.
+    image: timescale/timescaledb:2.17.2-pg16
+    environment:
+      POSTGRES_USER: libreping
+      POSTGRES_PASSWORD: libreping
+      POSTGRES_DB: libreping
+    volumes:
+      - tsdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U libreping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  hub:
+    build:
+      context: .
+      dockerfile: hub/Dockerfile
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: "postgres://libreping:libreping@timescaledb:5432/libreping?sslmode=disable"
+      P2P_LISTEN: "/ip4/0.0.0.0/tcp/4001"
+      BOOTSTRAP_PEERS: "${BOOTSTRAP_PEERS:-}"
+      # Auto-join the mesh from a live seed directory (overridable / clearable).
+      BOOTSTRAP_SEEDS: "${BOOTSTRAP_SEEDS:-https://nl.lp.mw.gg,https://ca.lp.mw.gg,https://sg.lp.mw.gg}"
+      # Mesh reachability (NAT/containers) — see .env.example.
+      DEFAULT_BOOTSTRAP: "${DEFAULT_BOOTSTRAP:-}"
+      P2P_ANNOUNCE_ADDRS: "${P2P_ANNOUNCE_ADDRS:-}"
+      P2P_RELAYS: "${P2P_RELAYS:-}"
+      ENABLE_MDNS: "${ENABLE_MDNS:-false}"
+      HUB_ALLOW_PRIVATE_PEERS: "${HUB_ALLOW_PRIVATE_PEERS:-false}"
+      WRITE_RATE_PER_MIN: "${WRITE_RATE_PER_MIN:-}"
+      TRUST_POLICY: "${TRUST_POLICY:-open}"
+      TRUST_ALLOWLIST: "${TRUST_ALLOWLIST:-}"
+      TARGET_REDUNDANCY: "${TARGET_REDUNDANCY:-3}"
+      # Partial-replication storage role + capacity.
+      HUB_STORAGE: "${HUB_STORAGE:-shards}"
+      HUB_STORAGE_CAPACITY: "${HUB_STORAGE_CAPACITY:-1}"
+      # Result storage tiers (compress / raw / hourly / daily retention days).
+      RESULT_COMPRESS_AFTER_DAYS: "${RESULT_COMPRESS_AFTER_DAYS:-2}"
+      RESULT_RETENTION_DAYS: "${RESULT_RETENTION_DAYS:-7}"
+      RESULT_HOURLY_RETENTION_DAYS: "${RESULT_HOURLY_RETENTION_DAYS:-90}"
+      RESULT_DAILY_RETENTION_DAYS: "${RESULT_DAILY_RETENTION_DAYS:-730}"
+      ADVERTISE: "${ADVERTISE:-true}"
+      PUBLIC_URL: "${PUBLIC_URL:-}"
+      HUB_NAME: "${HUB_NAME:-}"
+      # Location is auto-detected from the public IP when unset; override here.
+      HUB_LOCATION: "${HUB_LOCATION:-}"
+      HUB_GEOIP: "${HUB_GEOIP:-true}"
+      SEED_CHECK_TARGET: "${SEED_CHECK_TARGET:-https://example.com}"
+      # Alert engine cadence + scheme policy (channels need no other config).
+      ALERT_INTERVAL: "${ALERT_INTERVAL:-30s}"
+      ALERT_HUB_TTL: "${ALERT_HUB_TTL:-3m}"
+      ALERT_WEBHOOK_ALLOW_HTTP: "${ALERT_WEBHOOK_ALLOW_HTTP:-false}"
+      HUB_KEY_PATH: "/data/hub.key"
+      MIGRATIONS_DIR: "/migrations"
+    volumes:
+      - hubdata:/data
+    ports:
+      - "8080:8080"   # HTTP API / dashboard backend
+      - "4001:4001"   # libp2p mesh (expose publicly to federate with peers)
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    depends_on:
+      - hub
+    ports:
+      - "8081:80"
+
+  probe:
+    build:
+      context: .
+      dockerfile: probe/Dockerfile
+    depends_on:
+      - hub
+    environment:
+      HUB_URL: "http://hub:8080"
+      # Location is auto-detected from the public IP when unset; override here.
+      PROBE_LOCATION: "${PROBE_LOCATION:-}"
+      PROBE_GEOIP: "${PROBE_GEOIP:-true}"
+      MAX_CHECKS_PER_MINUTE: "${MAX_CHECKS_PER_MINUTE:-300}"
+      DISABLE_CHECKS: "${DISABLE_CHECKS:-}"
+      PROBE_KEY_PATH: "/data/probe.key"
+      POLL_INTERVAL: "30s"
+    volumes:
+      - probedata:/data
+    # ICMP/traceroute checks need raw sockets. If your host disallows this cap,
+    # remove the line — the probe auto-detects and simply won't offer them.
+    cap_add: ["NET_RAW"]
+
+volumes:
+  tsdata:
+  hubdata:
+  probedata:
