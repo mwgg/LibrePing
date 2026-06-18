@@ -16,6 +16,10 @@ export default function GlobalMap() {
   const markersRef = useRef<Marker[]>([]);
   const loadedRef = useRef(false);
   const [view, setView] = useState<NetworkView>({ hubs: [], probes: [] });
+  // Latest data, so the map's load handler draws what has arrived rather than the
+  // empty value captured at mount (data usually arrives before the style loads).
+  const viewRef = useRef(view);
+  viewRef.current = view;
 
   useEffect(() => {
     const map = new maplibregl.Map({ container: "map", style: MAP_STYLE, center: [10, 25], zoom: 1.4 });
@@ -29,11 +33,11 @@ export default function GlobalMap() {
         paint: { "line-color": HUB_COLOR, "line-width": 1, "line-opacity": 0.28 },
       });
       loadedRef.current = true;
-      draw(map, markersRef, view);
+      draw(map, markersRef, viewRef.current);
     });
     const refresh = () => fetchNetwork().then(setView);
     refresh();
-    const timer = setInterval(refresh, 30_000);
+    const timer = setInterval(refresh, 15_000);
     return () => {
       clearInterval(timer);
       for (const m of markersRef.current) m.remove();
