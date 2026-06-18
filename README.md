@@ -16,6 +16,10 @@
   More public hubs in the <a href="https://github.com/mwgg/LibrePing/wiki/Public-hubs">wiki</a>.
 </p>
 
+<p align="center">
+  <a href="https://nl.lp.mw.gg"><img src="https://nl.lp.mw.gg/api/v1/network/banner.svg" alt="LibrePing live network — hubs, probes, countries" width="620"></a>
+</p>
+
 LibrePing checks whether websites and services are online, **from many places
 around the world at once**, and shows the results on a live map. Unlike
 commercial monitoring services, there is **no central company and no single

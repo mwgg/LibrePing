@@ -263,6 +263,43 @@ async function alertRecipientHubs(): Promise<HubKey[]> {
   return out;
 }
 
+// --- Network topology (the "network" showcase map) ---
+
+interface GeoLoc {
+  country: string;
+  city: string;
+  lat: number;
+  lon: number;
+}
+export interface HubNode {
+  hub_id: string;
+  name?: string;
+  public_url?: string;
+  location: GeoLoc;
+  self?: boolean;
+}
+export interface ProbeNode {
+  probe_id: string;
+  location: GeoLoc;
+  hub_id: string; // the hub this probe is talking to
+  last_seen_ms: number;
+}
+export interface NetworkView {
+  hubs: HubNode[];
+  probes: ProbeNode[];
+}
+
+export async function fetchNetwork(): Promise<NetworkView> {
+  try {
+    const res = await fetch("/api/v1/network");
+    if (!res.ok) return { hubs: [], probes: [] };
+    const v = await res.json();
+    return { hubs: Array.isArray(v.hubs) ? v.hubs : [], probes: Array.isArray(v.probes) ? v.probes : [] };
+  } catch {
+    return { hubs: [], probes: [] };
+  }
+}
+
 export async function listServices(owner: string): Promise<Service[]> {
   const res = await fetch(`/api/v1/services?owner=${encodeURIComponent(owner)}`);
   if (!res.ok) return [];

@@ -1096,6 +1096,34 @@ select:focus {
 .map-marker.is-down {
   animation: pulse-down 1.6s ease-out infinite;
 }
+/* Network topology map: probe dots + hub diamonds. */
+.map-marker.net-probe {
+  width: 10px;
+  height: 10px;
+  border-width: 2px;
+}
+.net-diamond {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  border: 1.5px solid #fffdf8;
+  transform: rotate(45deg);
+}
+.net-hub-marker {
+  width: 14px;
+  height: 14px;
+  box-shadow: 0 1px 5px rgba(28, 30, 26, 0.45);
+  cursor: pointer;
+}
+.net-stats {
+  font-size: 14px;
+  color: var(--ink);
+  margin-bottom: 3px;
+}
+.net-stats b {
+  font-family: var(--mono);
+}
 @keyframes pulse-down {
   0% {
     box-shadow: 0 1px 4px rgba(28, 30, 26, 0.4), 0 0 0 0 rgba(185, 28, 28, 0.5);

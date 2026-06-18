@@ -103,12 +103,19 @@ type Server struct {
 	selfAddrsFn func() []string
 	interest    *interest.Set
 	self        shard.Hub
+	selfLoc     protocol.Location
+	selfName    string
+	selfURL     string
+	allowPriv   bool
 	remote      *remote.Client
 	outbox      *outbox.Outbox
 
 	mu     sync.Mutex
 	probes map[string]registeredProbe
 	now    func() time.Time
+
+	netMu    sync.Mutex
+	netCache *networkCache
 
 	rcMu        sync.Mutex
 	remoteCache map[string]cachedResults
@@ -143,6 +150,12 @@ type Config struct {
 	// at GET /api/v1/identity so a new hub can bootstrap by dialing this one
 	// directly (the hub directory lists peers, never self). Optional.
 	SelfAddrs func() []string
+	// SelfLocation / SelfName / SelfPublicURL describe this hub for the network
+	// topology map (GET /api/v1/network), where the hub must place itself — the
+	// directory only lists peers, never self.
+	SelfLocation  protocol.Location
+	SelfName      string
+	SelfPublicURL string
 	// Interest decides which submitted results this hub persists (partial
 	// replication). Nil stores everything.
 	Interest *interest.Set
@@ -204,6 +217,10 @@ func New(cfg Config) *Server {
 		selfAddrsFn: cfg.SelfAddrs,
 		interest:    cfg.Interest,
 		self:        cfg.SelfHub,
+		selfLoc:     cfg.SelfLocation,
+		selfName:    cfg.SelfName,
+		selfURL:     cfg.SelfPublicURL,
+		allowPriv:   cfg.AllowPrivatePeers,
 		remote:      remote.NewClient(cfg.AllowPrivatePeers),
 		outbox:      cfg.Outbox,
 		probes:      map[string]registeredProbe{},
@@ -227,6 +244,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/results/query", s.handleQuery)     // holder query (by check_id or shard)
 	mux.HandleFunc("GET /api/v1/results/history", s.handleHistory) // rolled-up history for one check
 	mux.HandleFunc("GET /api/v1/locations", s.handleLocations)
+	mux.HandleFunc("GET /api/v1/probes", s.handleProbes)                       // this hub's registered probes
+	mux.HandleFunc("GET /api/v1/network", s.handleNetwork)                     // network topology: hubs + probes + edges
+	mux.HandleFunc("GET /api/v1/network/banner.svg", s.handleNetworkBannerSVG) // embeddable stats banner
 	mux.HandleFunc("GET /api/v1/hubs", s.handleHubs)
 	mux.HandleFunc("POST /api/v1/subscriptions", s.writeLimit.limit(s.handleSubscribe)) // create or tombstone (signed)
 	mux.HandleFunc("GET /api/v1/services", s.handleServices)                            // my services for ?owner=

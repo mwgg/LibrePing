@@ -227,6 +227,12 @@ func main() {
 	// anti-entropy, bounded to the gossip window so it stays small.
 	ob := outbox.New(2048, resultGossipWindow)
 
+	// This hub's own identity for the directory/topology — resolved once and
+	// shared with both the API (network map) and the advertise loop.
+	selfURL := strings.TrimRight(os.Getenv("PUBLIC_URL"), "/")
+	selfName := os.Getenv("HUB_NAME")
+	selfLoc := resolveLocation(ctx, os.Getenv("HUB_LOCATION"), boolDefault(os.Getenv("HUB_GEOIP"), true), log)
+
 	srv := api.New(api.Config{
 		Store:             resultStore,
 		Catalog:           catalogStore,
@@ -241,6 +247,9 @@ func main() {
 		WriteRatePerMin:   atoiDefault(os.Getenv("WRITE_RATE_PER_MIN"), 0),
 		MeshDiagnostics:   func() any { return mesh.Diagnostics() },
 		SelfAddrs:         mesh.PublicAddrs,
+		SelfLocation:      selfLoc,
+		SelfName:          selfName,
+		SelfPublicURL:     selfURL,
 		Interest:          interestSet,
 		SelfHub:           selfHub,
 		AllowPrivatePeers: allowPrivatePeers,
@@ -322,7 +331,7 @@ func main() {
 	// converge) and advertise this hub if enabled. Intervals govern how fast a
 	// newly-joined hub converges on the catalog/directory.
 	go gossipLoop(ctx, log, id, resultStore, catalogStore, subStore, alertStore, mesh, ob, srv.PushToHolders, durDefault(os.Getenv("CATALOG_GOSSIP_INTERVAL"), time.Minute))
-	go advertiseLoop(ctx, log, id, enc.PublicKey(), selfHub, mesh, durDefault(os.Getenv("ADVERTISE_INTERVAL"), time.Minute))
+	go advertiseLoop(ctx, log, id, enc.PublicKey(), selfHub, mesh, selfName, selfURL, selfLoc, durDefault(os.Getenv("ADVERTISE_INTERVAL"), time.Minute))
 
 	// Alert engine: this hub fires only the rules rendezvous-hashing assigns to
 	// it among the recipient hubs that are currently live. A short liveness
@@ -742,18 +751,15 @@ func seedHealLoop(ctx context.Context, log *slog.Logger, mesh *p2p.Node, seeds [
 
 // advertiseLoop periodically gossips this hub's signed announcement, if
 // advertising is enabled and a PUBLIC_URL is configured.
-func advertiseLoop(ctx context.Context, log *slog.Logger, id *identity.Identity, encPub []byte, self shard.Hub, mesh *p2p.Node, every time.Duration) {
+func advertiseLoop(ctx context.Context, log *slog.Logger, id *identity.Identity, encPub []byte, self shard.Hub, mesh *p2p.Node, name, publicURL string, loc protocol.Location, every time.Duration) {
 	if !boolDefault(os.Getenv("ADVERTISE"), true) {
 		log.Info("hub advertisement disabled")
 		return
 	}
-	publicURL := strings.TrimRight(os.Getenv("PUBLIC_URL"), "/")
 	if publicURL == "" {
 		log.Warn("ADVERTISE is on but PUBLIC_URL is empty; not advertising")
 		return
 	}
-	name := os.Getenv("HUB_NAME")
-	loc := resolveLocation(ctx, os.Getenv("HUB_LOCATION"), boolDefault(os.Getenv("HUB_GEOIP"), true), log)
 	log.Info("advertising hub", "public_url", publicURL)
 
 	announce := func() {
