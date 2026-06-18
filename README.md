@@ -11,6 +11,11 @@
   <b>Open-source, decentralized uptime monitoring — from everywhere, owned by no one.</b>
 </p>
 
+<p align="center">
+  <b>Try it now: <a href="https://nl.lp.mw.gg">nl.lp.mw.gg</a></b> — no signup.
+  More public hubs in the <a href="https://github.com/mwgg/LibrePing/wiki/Public-hubs">wiki</a>.
+</p>
+
 LibrePing checks whether websites and services are online, **from many places
 around the world at once**, and shows the results on a live map. Unlike
 commercial monitoring services, there is **no central company and no single
