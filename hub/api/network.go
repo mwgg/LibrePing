@@ -21,6 +21,12 @@ const (
 	networkCacheTTL = 30 * time.Second // peers are fanned out to at most this often
 	networkMaxPeers = 64               // bound the fan-out
 	networkFetchPar = 8                // concurrent peer fetches
+	// gossipProbeTTL is how recently a probe must have produced a result (by the
+	// probe's own clock) to be placed on the map as a "gossip-only" probe — one
+	// whose home hub is not in the directory. Looser than the 3-min registration
+	// probeTTL to absorb gossip propagation lag and clock skew, so a steadily
+	// reporting probe doesn't flicker on and off the map.
+	gossipProbeTTL = 12 * time.Minute
 )
 
 // ProbeInfo is one probe as a hub knows it (served at GET /api/v1/probes).
@@ -39,12 +45,16 @@ type HubNode struct {
 	Self      bool              `json:"self,omitempty"`
 }
 
-// ProbeNode is a probe on the topology map, tagged with the hub it talks to.
+// ProbeNode is a probe on the topology map. A registered probe is tagged with
+// the hub it talks to (HubID, drawn as an edge). A probe known only from the
+// gossiped result stream — its home hub isn't in the directory — has an empty
+// HubID and ViaGossip=true, so it shows as a dot with no edge.
 type ProbeNode struct {
 	ProbeID    string            `json:"probe_id"`
 	Location   protocol.Location `json:"location"`
 	HubID      string            `json:"hub_id"`
 	LastSeenMS int64             `json:"last_seen_ms"`
+	ViaGossip  bool              `json:"via_gossip,omitempty"`
 }
 
 // NetworkView is the whole topology: hubs, probes, and (implicitly) the
@@ -181,6 +191,24 @@ func (s *Server) buildNetworkView(ctx context.Context) NetworkView {
 	wg.Wait()
 	for _, r := range results {
 		add(r.hubID, r.ps)
+	}
+
+	// Augment with probes known only from the gossiped result stream — their home
+	// hub isn't in the directory, so registration fan-out never found them, yet
+	// their signed results federate here. Show each as a dot (no hub edge). A
+	// probe already placed via registration wins (it carries a hub edge), so we
+	// only add IDs not already seen. Results don't record which hub a probe talks
+	// to, hence no edge for these.
+	if s.store != nil {
+		sinceMS := s.now().Add(-gossipProbeTTL).UnixMilli()
+		if seen, err := s.store.RecentProbes(ctx, sinceMS); err == nil {
+			for _, p := range seen {
+				if _, ok := latest[p.ProbeID]; ok {
+					continue
+				}
+				latest[p.ProbeID] = ProbeNode{ProbeID: p.ProbeID, Location: p.Location, LastSeenMS: p.LastSeenMS, ViaGossip: true}
+			}
+		}
 	}
 
 	probes := make([]ProbeNode, 0, len(latest))

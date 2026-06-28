@@ -1102,6 +1102,13 @@ select:focus {
   height: 10px;
   border-width: 2px;
 }
+/* Gossip-only probe: known from the result stream, home hub not in the directory
+   (no edge). Drawn hollow to distinguish it from a registered probe. */
+.map-marker.net-probe-gossip {
+  background: #fffdf8 !important;
+  border-color: var(--up, #15803d);
+  opacity: 0.9;
+}
 .net-diamond {
   display: inline-block;
   width: 11px;

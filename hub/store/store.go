@@ -36,6 +36,13 @@ type ResultStore interface {
 	RecentSinceCheck(ctx context.Context, checkID string, sinceMS, beforeMS int64, limit int) ([]protocol.SignedResult, error)
 	// RecentSinceShard is RecentSinceCheck for a whole shard (backfill/repair).
 	RecentSinceShard(ctx context.Context, shardID uint32, sinceMS, beforeMS int64, limit int) ([]protocol.SignedResult, error)
+	// RecentProbes returns the distinct probes that produced a result with
+	// timestamp_ms >= sinceMS, each with its latest self-declared location and
+	// newest result timestamp. It surfaces probes that contribute results even
+	// when their home hub is not in the directory — the topology map's
+	// "gossip-only" probes. It reflects only what this hub holds locally (under
+	// partial replication a hub holds only its shards' results).
+	RecentProbes(ctx context.Context, sinceMS int64) ([]ProbeSeen, error)
 	// HistoryRange returns per-(probe) rolled-up summaries for one check over
 	// [fromMS, toMS), at a resolution chosen from the span (hourly for short
 	// ranges, daily for long ones). Summaries are locally-derived, NOT per-result
@@ -66,6 +73,15 @@ type HistorySummary struct {
 	CheckType     string            `json:"check_type"`
 	Target        string            `json:"target"`
 	Location      protocol.Location `json:"location"`
+}
+
+// ProbeSeen is a probe observed in the result stream: its most recent
+// self-declared location and the newest result timestamp. Used to place probes
+// on the topology map even when their home hub is not in the directory.
+type ProbeSeen struct {
+	ProbeID    string
+	Location   protocol.Location
+	LastSeenMS int64
 }
 
 const (
@@ -177,6 +193,27 @@ func (m *MemStore) filterSince(match func(protocol.ResultContent) bool, sinceMS,
 		out = out[:limit]
 	}
 	return out
+}
+
+func (m *MemStore) RecentProbes(_ context.Context, sinceMS int64) ([]ProbeSeen, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	latest := map[string]ProbeSeen{}
+	for _, sr := range m.all {
+		c := sr.Content
+		if c.TimestampMS < sinceMS {
+			continue
+		}
+		if cur, ok := latest[c.ProbeID]; !ok || c.TimestampMS > cur.LastSeenMS {
+			latest[c.ProbeID] = ProbeSeen{ProbeID: c.ProbeID, Location: c.Location, LastSeenMS: c.TimestampMS}
+		}
+	}
+	out := make([]ProbeSeen, 0, len(latest))
+	for _, p := range latest {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeenMS > out[j].LastSeenMS })
+	return out, nil
 }
 
 func (m *MemStore) HistoryRange(_ context.Context, checkID string, fromMS, toMS int64) ([]HistorySummary, error) {

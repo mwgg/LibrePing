@@ -114,7 +114,7 @@ function draw(map: MapLibreMap, markersRef: React.MutableRefObject<Marker[]>, vi
   for (const p of view.probes) {
     if (!placed(p.location)) continue;
     const el = document.createElement("div");
-    el.className = "map-marker net-probe";
+    el.className = p.via_gossip ? "map-marker net-probe net-probe-gossip" : "map-marker net-probe";
     el.style.background = PROBE_COLOR;
     markersRef.current.push(
       new maplibregl.Marker({ element: el })
@@ -162,7 +162,13 @@ function probePopup(p: ProbeNode, hub?: HubNode): HTMLElement {
   root.appendChild(title);
   root.appendChild(document.createElement("br"));
   const line = document.createElement("span");
-  line.textContent = "Probe → " + (hub ? hub.name || hub.public_url?.replace(/^https?:\/\//, "") || hub.hub_id.slice(0, 10) : "?");
+  if (p.via_gossip || !hub) {
+    // Home hub isn't in the directory; we know this probe only from its gossiped,
+    // signed results, so there's no hub edge to draw.
+    line.textContent = "Probe · via gossip";
+  } else {
+    line.textContent = "Probe → " + (hub.name || hub.public_url?.replace(/^https?:\/\//, "") || hub.hub_id.slice(0, 10));
+  }
   root.appendChild(line);
   return root;
 }

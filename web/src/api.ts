@@ -281,8 +281,9 @@ export interface HubNode {
 export interface ProbeNode {
   probe_id: string;
   location: GeoLoc;
-  hub_id: string; // the hub this probe is talking to
+  hub_id: string; // the hub this probe is talking to ("" for gossip-only probes)
   last_seen_ms: number;
+  via_gossip?: boolean; // known only from the result stream; its hub isn't in the directory
 }
 export interface NetworkView {
   hubs: HubNode[];

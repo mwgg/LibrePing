@@ -150,6 +150,32 @@ func (s *PgStore) RecentSinceShard(ctx context.Context, shardID uint32, sinceMS,
 	return scanResults(rows)
 }
 
+// RecentProbes returns the latest self-declared location per probe across
+// results newer than sinceMS. DISTINCT ON with the (probe_id, timestamp_ms DESC)
+// index (results_probe_idx) yields each probe's most recent row cheaply.
+func (s *PgStore) RecentProbes(ctx context.Context, sinceMS int64) ([]ProbeSeen, error) {
+	const q = `
+SELECT DISTINCT ON (probe_id) probe_id, country, city, lat, lon, timestamp_ms
+FROM results
+WHERE timestamp_ms >= $1
+ORDER BY probe_id, timestamp_ms DESC`
+	rows, err := s.pool.Query(ctx, q, sinceMS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProbeSeen
+	for rows.Next() {
+		var p ProbeSeen
+		if err := rows.Scan(&p.ProbeID, &p.Location.Country, &p.Location.City,
+			&p.Location.Lat, &p.Location.Lon, &p.LastSeenMS); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // HistoryRange serves rolled-up history for one check from the continuous
 // aggregates (results_hourly / results_daily). Real-time aggregation means the
 // most recent, not-yet-materialized window is filled from raw on the fly, so the
