@@ -189,7 +189,7 @@ You need [Docker](https://docs.docker.com/get-docker/) installed. That's it.
 ```bash
 git clone https://github.com/mwgg/LibrePing.git
 cd LibrePing
-docker compose up --build
+docker compose up -d --build
 ```
 
 Then open **http://localhost:8081** in your browser. You'll see the world map;
@@ -242,7 +242,7 @@ defaults to the public network, so this is the whole thing:
 ```bash
 git clone https://github.com/mwgg/LibrePing.git
 cd LibrePing
-docker compose -f docker-compose.probe.yml up --build
+docker compose -f docker-compose.probe.yml up -d --build
 ```
 
 To point it at your own hub or set a location, copy the short probe env file
@@ -251,7 +251,7 @@ full hub `.env.example`. Or just pass `HUB_URL` inline:
 
 ```bash
 HUB_URL=https://your-hub.example \
-  docker compose -f docker-compose.probe.yml up --build
+  docker compose -f docker-compose.probe.yml up -d --build
 ```
 
 **A probe is never tied to a single hub.** `HUB_URL` is a comma-separated list
@@ -268,7 +268,7 @@ even before discovery kicks in:
 
 ```bash
 HUB_URL=https://nl.lp.mw.gg,https://your-other-hub.example \
-  docker compose -f docker-compose.probe.yml up --build
+  docker compose -f docker-compose.probe.yml up -d --build
 ```
 
 By default the probe **detects its own location from its public IP** (free,

@@ -77,7 +77,7 @@ whichever hub it lands on, so a probe contributes to the whole network, not just
 "its" hub.
 
 ```bash
-docker compose -f docker-compose.probe.yml up --build
+docker compose -f docker-compose.probe.yml up -d --build
 ```
 
 That's the whole thing — it defaults to the public network, auto-detects its
@@ -87,7 +87,7 @@ customise, copy the short probe env file (one meaningful line, not the full hub
 
 ```bash
 cp .env.probe.example .env
-docker compose -f docker-compose.probe.yml up --build
+docker compose -f docker-compose.probe.yml up -d --build
 ```
 
 **A probe is not tied to one hub.** `HUB_URL` is a comma-separated list of seed
@@ -99,7 +99,7 @@ before discovery runs:
 
 ```bash
 HUB_URL=https://nl.lp.mw.gg,https://your-other-hub.example \
-  docker compose -f docker-compose.probe.yml up --build
+  docker compose -f docker-compose.probe.yml up -d --build
 ```
 
 Useful knobs (full list in the [reference](#probe)):
@@ -125,7 +125,7 @@ hub), and a local probe.
 
 ```bash
 cp .env.example .env     # then edit — at minimum set PUBLIC_URL (see below)
-docker compose up --build
+docker compose up -d --build
 ```
 
 - Dashboard: http://localhost:8081

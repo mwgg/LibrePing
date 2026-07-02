@@ -40,11 +40,11 @@ web:
 
 ## up: run a full hub node (hub + db + dashboard + local probe)
 up:
-	docker compose up --build
+	docker compose up -d --build
 
 ## probe-up: run a probe-only node (set HUB_URL)
 probe-up:
-	docker compose -f docker-compose.probe.yml up --build
+	docker compose -f docker-compose.probe.yml up -d --build
 
 ## down: stop and remove the local stack
 down:

@@ -2,7 +2,7 @@
 # without hosting a hub or database yourself.
 #
 # Zero config — it defaults to the public network:
-#   docker compose -f docker-compose.probe.yml up --build
+#   docker compose -f docker-compose.probe.yml up -d --build
 #
 # To customise (location, your own hub, etc.), copy the probe env example first:
 #   cp .env.probe.example .env   # then edit
@@ -13,6 +13,7 @@ services:
     build:
       context: .
       dockerfile: probe/Dockerfile
+    restart: unless-stopped
     environment:
       HUB_URL: "${HUB_URL:-https://nl.lp.mw.gg}"
       PROBE_LOCATION: "${PROBE_LOCATION:-}"

@@ -14,6 +14,7 @@ name: libreping-2hub
 services:
   hub1:
     build: { context: ., dockerfile: hub/Dockerfile }
+    restart: unless-stopped
     environment:
       HTTP_ADDR: ":8080"
       P2P_LISTEN: "/ip4/0.0.0.0/tcp/4001"
@@ -33,6 +34,7 @@ services:
 
   hub2:
     build: { context: ., dockerfile: hub/Dockerfile }
+    restart: unless-stopped
     environment:
       HTTP_ADDR: ":8080"
       P2P_LISTEN: "/ip4/0.0.0.0/tcp/4001"
@@ -49,6 +51,7 @@ services:
 
   probe:
     build: { context: ., dockerfile: probe/Dockerfile }
+    restart: unless-stopped
     environment:
       HUB_URL: "http://hub1:8080"
       PROBE_LOCATION: "DE,Frankfurt,50.11,8.68"

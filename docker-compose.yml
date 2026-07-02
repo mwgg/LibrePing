@@ -1,7 +1,7 @@
 # Full HUB node: a publicly-reachable hub + its database + dashboard + a local
 # probe. This is what you run to host your own corner of the LibrePing mesh.
 #
-#   docker compose up --build
+#   docker compose up -d --build
 #
 # Dashboard: http://localhost:8081   API: http://localhost:8080
 # To join peer hubs, set BOOTSTRAP_PEERS (see .env.example).
@@ -12,6 +12,7 @@ services:
     # Pinned (not :latest-pg16) so a rebuild can't silently change the database
     # engine under a running deployment. Bump deliberately.
     image: timescale/timescaledb:2.17.2-pg16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: libreping
       POSTGRES_PASSWORD: libreping
@@ -28,6 +29,7 @@ services:
     build:
       context: .
       dockerfile: hub/Dockerfile
+    restart: unless-stopped
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -79,6 +81,7 @@ services:
     build:
       context: .
       dockerfile: web/Dockerfile
+    restart: unless-stopped
     depends_on:
       - hub
     ports:
@@ -88,6 +91,7 @@ services:
     build:
       context: .
       dockerfile: probe/Dockerfile
+    restart: unless-stopped
     depends_on:
       - hub
     environment:
