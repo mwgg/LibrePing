@@ -11,6 +11,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -38,6 +39,33 @@ const remoteCacheTTL = 15 * time.Second
 // storageWindow is how recently a peer hub must have been seen to count as a
 // live storage holder (matches the hub's interest loop).
 const storageWindow = 10 * time.Minute
+
+// maxBodyBytes bounds a POST request body. Every signed submission this hub
+// accepts (result, probe registration, subscription, alert rule, check-create)
+// is small JSON, so 64 KiB is generous while stopping a client from forcing the
+// hub to buffer and allocate an arbitrarily large body before field bounds
+// apply. Enforced via http.MaxBytesReader in decodeJSON.
+const maxBodyBytes = 64 << 10
+
+// decodeJSON caps r.Body at limit and decodes it as JSON into dst. On a body
+// that exceeds the cap it writes 413 Request Entity Too Large; on any other
+// malformed input it writes 400 with badMsg. It returns false when it has
+// written an error response — the caller just returns. Wrapping every POST
+// handler this way keeps an oversized or slow body from being fully read before
+// validation, and maps MaxBytesReader's error to 413 rather than a bare 500.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any, limit int64, badMsg string) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return false
+		}
+		http.Error(w, badMsg, http.StatusBadRequest)
+		return false
+	}
+	return true
+}
 
 func atoi64(s string) int64 {
 	n, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
@@ -99,6 +127,9 @@ type Server struct {
 	redundancy  int
 	log         *slog.Logger
 	writeLimit  *ipRateLimiter
+	resultLimit *ipRateLimiter
+	readLimit   *ipRateLimiter
+	pushSem     chan struct{}
 	meshDiagFn  func() any
 	selfAddrsFn func() []string
 	interest    *interest.Set
@@ -143,6 +174,20 @@ type Config struct {
 	// check/subscription/alert, probe register). 0 uses a sane default; set
 	// negative to disable.
 	WriteRatePerMin int
+	// ResultRatePerMin caps per-IP result submissions (POST /results). This is
+	// the probe hot path — a whole probe fleet behind one NAT submits per
+	// assigned check per interval — so it must be far more generous than the
+	// write-mutation limit. 0 uses a sane default; set negative to disable.
+	ResultRatePerMin int
+	// ReadRatePerMin caps per-IP holder reads (GET /results/query), used by peer
+	// hubs for on-demand reads and shard backfill. 0 uses a sane default; set
+	// negative to disable.
+	ReadRatePerMin int
+	// TrustProxyHeaders makes the rate limiter honor X-Forwarded-For / X-Real-IP
+	// (last hop) instead of the connection peer. Enable ONLY when a trusted
+	// reverse proxy fronts the API and rewrites those headers; otherwise they are
+	// attacker-spoofable and would void the limit. Default false.
+	TrustProxyHeaders bool
 	// MeshDiagnostics returns a JSON-serializable snapshot of P2P health for
 	// GET /api/v1/p2p. Optional (nil → endpoint reports unavailable).
 	MeshDiagnostics func() any
@@ -200,6 +245,24 @@ func New(cfg Config) *Server {
 	if rate == 0 {
 		rate = 120
 	}
+	// Result submission is the probe hot path and is keyed by the connection
+	// peer, so an entire probe fleet behind one NAT shares a single bucket. Size
+	// the default generously — 6000/min (100/s, burst ~1500) comfortably admits
+	// dozens of full-capacity probes (maxDeclaredCapacity is 600/min each) behind
+	// one address while still capping a single-source flood, so cheaply-minted
+	// keys can't pump unbounded signed results through the verify+admit+store+gossip
+	// path. 0 means default; negative disables.
+	resultRate := cfg.ResultRatePerMin
+	if resultRate == 0 {
+		resultRate = 6000
+	}
+	// Holder reads (GET /results/query) are peer-hub traffic: on-demand reads and
+	// paginated shard backfill. 1200/min (burst ~300) is generous for a hub
+	// catching up many shards yet bounds a scraper hitting the 5000-row endpoint.
+	readRate := cfg.ReadRatePerMin
+	if readRate == 0 {
+		readRate = 1200
+	}
 	return &Server{
 		store:       cfg.Store,
 		catalog:     cfg.Catalog,
@@ -212,7 +275,10 @@ func New(cfg Config) *Server {
 		policy:      cfg.Policy,
 		redundancy:  cfg.Redundancy,
 		log:         cfg.Logger,
-		writeLimit:  newIPRateLimiter(rate, rate/4+1),
+		writeLimit:  newIPRateLimiter(rate, rate/4+1, cfg.TrustProxyHeaders),
+		resultLimit: newIPRateLimiter(resultRate, resultRate/4+1, cfg.TrustProxyHeaders),
+		readLimit:   newIPRateLimiter(readRate, readRate/4+1, cfg.TrustProxyHeaders),
+		pushSem:     make(chan struct{}, maxConcurrentHolderPush),
 		meshDiagFn:  cfg.MeshDiagnostics,
 		selfAddrsFn: cfg.SelfAddrs,
 		interest:    cfg.Interest,
@@ -239,10 +305,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/checks", s.handleChecks)                           // assigned subset for ?probe_id=
 	mux.HandleFunc("POST /api/v1/checks", s.writeLimit.limit(s.handleCreateCheck)) // create a monitor
 	mux.HandleFunc("GET /api/v1/catalog", s.handleCatalog)                         // full global catalog
-	mux.HandleFunc("POST /api/v1/results", s.handleSubmit)
+	mux.HandleFunc("POST /api/v1/results", s.resultLimit.limit(s.handleSubmit))
 	mux.HandleFunc("GET /api/v1/results/recent", s.handleRecent)
-	mux.HandleFunc("GET /api/v1/results/query", s.handleQuery)     // holder query (by check_id or shard)
-	mux.HandleFunc("GET /api/v1/results/history", s.handleHistory) // rolled-up history for one check
+	mux.HandleFunc("GET /api/v1/results/query", s.readLimit.limit(s.handleQuery)) // holder query (by check_id or shard)
+	mux.HandleFunc("GET /api/v1/results/history", s.handleHistory)                // rolled-up history for one check
 	mux.HandleFunc("GET /api/v1/locations", s.handleLocations)
 	mux.HandleFunc("GET /api/v1/probes", s.handleProbes)                       // this hub's registered probes
 	mux.HandleFunc("GET /api/v1/network", s.handleNetwork)                     // network topology: hubs + probes + edges
@@ -329,9 +395,20 @@ func (s *Server) handleIdentity(w http.ResponseWriter, _ *http.Request) {
 // assignments. The probe also enforces its own hard token-bucket cap.
 const maxDeclaredCapacity = 600
 
+// minDeclaredCapacity floors the per-minute capacity of a REGISTERED (remote,
+// signed) probe. The assigner treats Capacity <= 0 as "unlimited" plus
+// least-loaded priority — fine as a library default for a locally-configured
+// probe, but a remote registration declaring 0 would otherwise claim unlimited
+// capacity and soak up every assignment slot. Flooring here guarantees a signed
+// registration always maps to a finite, positive capacity.
+const minDeclaredCapacity = 1
+
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var reg protocol.SignedProbeRegistration
-	if err := json.NewDecoder(r.Body).Decode(&reg); err != nil || reg.Registration.ProbeID == "" {
+	if !decodeJSON(w, r, &reg, maxBodyBytes, "invalid registration") {
+		return
+	}
+	if reg.Registration.ProbeID == "" {
 		http.Error(w, "invalid registration", http.StatusBadRequest)
 		return
 	}
@@ -344,8 +421,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	req := reg.Registration
 	capacity := req.MaxChecksPerMinute
-	if capacity < 0 {
-		capacity = 0
+	if capacity < minDeclaredCapacity {
+		// 0/negative means "unlimited" to the assigner; a remote probe must not
+		// claim that, so floor to the minimum instead.
+		capacity = minDeclaredCapacity
 	}
 	if capacity > maxDeclaredCapacity {
 		capacity = maxDeclaredCapacity
@@ -437,7 +516,10 @@ func (s *Server) handleCreateCheck(w http.ResponseWriter, r *http.Request) {
 		IntervalSeconds int                `json:"interval_seconds"`
 		Params          map[string]string  `json:"params,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Target == "" || req.Type == "" {
+	if !decodeJSON(w, r, &req, maxBodyBytes, "invalid check: type and target are required") {
+		return
+	}
+	if req.Target == "" || req.Type == "" {
 		http.Error(w, "invalid check: type and target are required", http.StatusBadRequest)
 		return
 	}
@@ -445,6 +527,13 @@ func (s *Server) handleCreateCheck(w http.ResponseWriter, r *http.Request) {
 		req.IntervalSeconds = 60
 	}
 	spec := protocol.CheckSpec{Type: req.Type, Target: req.Target, IntervalSeconds: req.IntervalSeconds, Params: req.Params}
+	// Bound the free-form Target/Params before deriving an ID and gossiping the
+	// entry network-wide, so a created monitor can't push an oversized payload
+	// to every hub.
+	if err := admit.Spec(spec); err != nil {
+		http.Error(w, "invalid check: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	spec.ID = spec.DeriveID()
 
 	sc, err := protocol.SignCatalogEntry(s.identity, protocol.CatalogEntry{Spec: spec})
@@ -453,6 +542,13 @@ func (s *Server) handleCreateCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.catalog.UpsertCheck(r.Context(), sc); err != nil {
+		if errors.Is(err, store.ErrCatalogConflict) {
+			// This target's content-derived ID collides with a different check
+			// already in the catalog. Reject rather than overwrite, and don't
+			// gossip the impostor.
+			http.Error(w, "check id collides with an existing different check", http.StatusConflict)
+			return
+		}
 		http.Error(w, "catalog error", http.StatusInternalServerError)
 		return
 	}
@@ -474,8 +570,7 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 // handleSubmit verifies and admits a probe-submitted result, then gossips it.
 func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	var sr protocol.SignedResult
-	if err := json.NewDecoder(r.Body).Decode(&sr); err != nil {
-		http.Error(w, "invalid result", http.StatusBadRequest)
+	if !decodeJSON(w, r, &sr, maxBodyBytes, "invalid result") {
 		return
 	}
 	if err := sr.Verify(); err != nil {
@@ -509,13 +604,32 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		// result for anti-entropy and push it directly to the shard holders over
 		// HTTP, so it is durably delivered rather than silently dropped.
 		s.outbox.Add(sr)
-		go s.PushToHolders(sr)
+		// Bound the concurrent holder-push fan-out: each push does HTTP to every
+		// shard holder with a multi-second timeout, so an unbounded goroutine per
+		// submission would let a flood explode goroutines and amplify load onto
+		// holders. The semaphore caps in-flight pushes; when saturated we shed the
+		// immediate push rather than block the submit handler — the outbox +
+		// anti-entropy gossip loop still delivers the result, so nothing is lost.
+		select {
+		case s.pushSem <- struct{}{}:
+			go func() {
+				defer func() { <-s.pushSem }()
+				s.PushToHolders(sr)
+			}()
+		default:
+			s.log.Warn("holder push shed: fan-out at capacity", "check_id", sr.Content.CheckID)
+		}
 	}
 	if err := s.mesh.PublishResult(r.Context(), sr); err != nil {
 		s.log.Warn("gossip publish failed", "err", err)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 }
+
+// maxConcurrentHolderPush bounds how many holder-push fan-outs may run at once
+// (see the submit path). Sized to sustain a busy home hub's steady stream of
+// non-held submissions without letting a flood spawn unbounded goroutines.
+const maxConcurrentHolderPush = 64
 
 // PushToHolders best-effort delivers a result directly to its shard holders over
 // HTTP (the holder re-runs verify→policy→admit on ingest). This is the durable
@@ -735,8 +849,7 @@ func (s *Server) handleHubs(w http.ResponseWriter, _ *http.Request) {
 // subscription with Deleted=true removes it.
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var ss protocol.SignedSubscription
-	if err := json.NewDecoder(r.Body).Decode(&ss); err != nil {
-		http.Error(w, "invalid subscription", http.StatusBadRequest)
+	if !decodeJSON(w, r, &ss, maxBodyBytes, "invalid subscription") {
 		return
 	}
 	if err := ss.Verify(); err != nil {
@@ -882,8 +995,7 @@ func overallStatus(locs []LocationStatus) string {
 // and gossips it.
 func (s *Server) handleAlertRule(w http.ResponseWriter, r *http.Request) {
 	var sa protocol.SignedAlertRule
-	if err := json.NewDecoder(r.Body).Decode(&sa); err != nil {
-		http.Error(w, "invalid alert rule", http.StatusBadRequest)
+	if !decodeJSON(w, r, &sa, maxBodyBytes, "invalid alert rule") {
 		return
 	}
 	if err := sa.Verify(); err != nil {

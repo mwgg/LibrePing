@@ -29,9 +29,43 @@ var (
 	metadataV6 = net.ParseIP("fd00:ec2::254")
 )
 
+// blockedCIDRs are non-public ranges Go's IsPrivate()/IsLinkLocal*/etc. do not
+// cover but that an outbound request still must never reach. Parsed once at
+// startup. IPNet.Contains normalizes IPv4-mapped-IPv6 forms via To4(), so a
+// mapped ::ffff:100.64.0.1 is caught by the IPv4 CIDRs here.
+var blockedCIDRs = mustParseCIDRs(
+	// 100.64.0.0/10 — RFC 6598 shared address space (CGNAT, and the range
+	// Tailscale hands out): a hub on a tailnet must not be SSRF'd into the
+	// operator's private tailnet via an owner-supplied webhook destination.
+	"100.64.0.0/10",
+	"192.0.0.0/24",       // RFC 6890 IETF protocol assignments
+	"198.18.0.0/15",      // RFC 2544 benchmarking
+	"255.255.255.255/32", // limited broadcast
+	"0.0.0.0/8",          // RFC 1122 "this network" (0.0.0.0 unspecified is handled separately)
+	// 64:ff9b::/96 — RFC 6052 NAT64 well-known prefix: these embed an IPv4
+	// address (e.g. 64:ff9b::7f00:1 → 127.0.0.1), so a resolver behind a NAT64
+	// gateway would translate them back to blocked v4 targets.
+	"64:ff9b::/96",
+	"fec0::/10", // deprecated IPv6 site-local
+)
+
+func mustParseCIDRs(cidrs ...string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic("netguard: bad blocked CIDR " + c + ": " + err.Error())
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 // IsBlockedIP reports whether ip is one an outbound request must not reach:
 // loopback, private (RFC1918 / unique-local), link-local, multicast,
-// unspecified, or a cloud metadata endpoint. nil is treated as blocked.
+// unspecified, a cloud metadata endpoint, or one of the additional non-public
+// ranges in blockedCIDRs (CGNAT/tailnet, NAT64, benchmarking, etc.). nil is
+// treated as blocked.
 func IsBlockedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
@@ -42,6 +76,11 @@ func IsBlockedIP(ip net.IP) bool {
 	}
 	if ip.Equal(metadataV4) || (metadataV6 != nil && ip.Equal(metadataV6)) {
 		return true
+	}
+	for _, n := range blockedCIDRs {
+		if n.Contains(ip) {
+			return true
+		}
 	}
 	return false
 }

@@ -44,27 +44,40 @@ type AlertStore interface {
 	MergeDelivery(ctx context.Context, ruleID string, d Delivery) (bool, error)
 }
 
+// storedRule pairs a signed alert rule with the local time it was accepted, so
+// pruning can enforce maxOwnerRecordTTL without mutating the signed record.
+type storedRule struct {
+	sa         protocol.SignedAlertRule
+	receivedMS int64
+}
+
 // MemAlerts is an in-memory AlertStore.
 type MemAlerts struct {
 	mu    sync.Mutex
-	rules map[string]protocol.SignedAlertRule
+	rules map[string]storedRule
 	state map[string]map[string]Delivery // ruleID -> hubID -> Delivery
 }
 
 func NewMemAlerts() *MemAlerts {
-	return &MemAlerts{rules: map[string]protocol.SignedAlertRule{}, state: map[string]map[string]Delivery{}}
+	return &MemAlerts{rules: map[string]storedRule{}, state: map[string]map[string]Delivery{}}
 }
 
 func (m *MemAlerts) Upsert(_ context.Context, sa protocol.SignedAlertRule) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := nowMS()
+	// Reject a rule stamped implausibly far in the future so it can't lock itself
+	// against later legitimate edits/tombstones.
+	if futureUpdatedMS(sa.Rule.UpdatedMS, now) {
+		return nil
+	}
 	id := sa.Rule.ID()
 	// Reject stale updates (replay defense); retain tombstones rather than
 	// erasing so an old signed active rule can't resurrect a deleted alert.
-	if cur, ok := m.rules[id]; ok && sa.Rule.UpdatedMS <= cur.Rule.UpdatedMS {
+	if cur, ok := m.rules[id]; ok && sa.Rule.UpdatedMS <= cur.sa.Rule.UpdatedMS {
 		return nil
 	}
-	m.rules[id] = sa
+	m.rules[id] = storedRule{sa: sa, receivedMS: now}
 	if sa.Rule.Deleted {
 		delete(m.state, id) // the alert is gone; drop its delivery state
 	}
@@ -76,16 +89,16 @@ func (m *MemAlerts) ListActive(_ context.Context) ([]protocol.SignedAlertRule, e
 	defer m.mu.Unlock()
 	now := nowMS()
 	out := []protocol.SignedAlertRule{}
-	for id, sa := range m.rules {
-		if expiredRule(sa, now) {
+	for id, st := range m.rules {
+		if expiredRule(st, now) {
 			delete(m.rules, id)
 			delete(m.state, id)
 			continue
 		}
-		if sa.Rule.Deleted {
+		if st.sa.Rule.Deleted {
 			continue
 		}
-		out = append(out, sa)
+		out = append(out, st.sa)
 	}
 	return out, nil
 }
@@ -95,28 +108,30 @@ func (m *MemAlerts) ListForGossip(_ context.Context) ([]protocol.SignedAlertRule
 	defer m.mu.Unlock()
 	now := nowMS()
 	out := []protocol.SignedAlertRule{}
-	for id, sa := range m.rules {
-		if expiredRule(sa, now) {
+	for id, st := range m.rules {
+		if expiredRule(st, now) {
 			delete(m.rules, id)
 			delete(m.state, id)
 			continue
 		}
-		out = append(out, sa)
+		out = append(out, st.sa)
 	}
 	return out, nil
 }
 
-// expiredRule reports whether a rule has passed its expiry. ExpiryMS == 0 means
-// no expiry.
-func expiredRule(sa protocol.SignedAlertRule, now int64) bool {
-	return sa.Rule.ExpiryMS > 0 && sa.Rule.ExpiryMS < now
+// expiredRule reports whether a rule has passed its effective expiry: the
+// earlier of its signed ExpiryMS (0 = no signed expiry) and the internal
+// receivedAt + maxOwnerRecordTTL cap, so a 0-expiry or far-future rule is still
+// pruned.
+func expiredRule(st storedRule, now int64) bool {
+	return effectiveExpiry(st.sa.Rule.ExpiryMS, st.receivedMS) < now
 }
 
 func (m *MemAlerts) GetRule(_ context.Context, ruleID string) (protocol.SignedAlertRule, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sa, ok := m.rules[ruleID]
-	return sa, ok, nil
+	st, ok := m.rules[ruleID]
+	return st.sa, ok, nil
 }
 
 func (m *MemAlerts) GetDelivery(_ context.Context, ruleID string) (Delivery, bool, error) {

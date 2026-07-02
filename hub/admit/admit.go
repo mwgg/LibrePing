@@ -32,6 +32,17 @@ const (
 	maxFieldLen      = 256
 	maxDetailEntries = 32
 	maxDetailValLen  = 1024
+	// maxIDLen bounds the self-certifying identifier fields (check ID, probe ID).
+	// Legitimate IDs are hex(sha256[:8]) = 16 chars (check) and hex(sha256[:16])
+	// = 32 chars (probe/node), so 64 is generous while stopping a signed result
+	// from stuffing a huge string into a key column or dashboard join.
+	maxIDLen = 64
+	// maxParamEntries / maxParamKeyLen / maxParamValLen bound a catalog spec's
+	// Params map so a created/gossiped monitor can't carry an oversized payload
+	// network-wide. A check's Params are small (method, keyword, port, …).
+	maxParamEntries = 32
+	maxParamKeyLen  = 256
+	maxParamValLen  = 2048
 )
 
 // ErrUnknownStatus, ErrTimestamp, etc. let callers distinguish reject reasons.
@@ -40,6 +51,7 @@ var (
 	ErrBadStatus       = errors.New("admit: unknown status value")
 	ErrCatalogMismatch = errors.New("admit: result target/type disagree with catalog entry")
 	ErrOversized       = errors.New("admit: result field exceeds size bound")
+	ErrSpecOversized   = errors.New("admit: check spec field exceeds size bound")
 )
 
 // CatalogLookup fetches a catalog entry by check ID. *store.CatalogStore's
@@ -72,6 +84,12 @@ func Result(ctx context.Context, catalog CatalogLookup, sr protocol.SignedResult
 		return ErrTimestamp
 	}
 
+	// Bound the self-certifying identifier fields. Verify() proves ProbeID
+	// derives from the key, but CheckID is attacker-chosen free-form; an
+	// unbounded one lands in a store key and every dashboard join.
+	if len(c.CheckID) > maxIDLen || len(c.ProbeID) > maxIDLen {
+		return fmt.Errorf("%w: identifier", ErrOversized)
+	}
 	if len(c.Target) > maxTargetLen {
 		return fmt.Errorf("%w: target", ErrOversized)
 	}
@@ -101,6 +119,26 @@ func Result(ctx context.Context, catalog CatalogLookup, sr protocol.SignedResult
 	}
 	if c.Target != entry.Entry.Spec.Target || c.CheckType != entry.Entry.Spec.Type {
 		return ErrCatalogMismatch
+	}
+	return nil
+}
+
+// Spec bounds a catalog spec's free-form fields (Target and Params) before it is
+// stored and gossiped network-wide. A monitor's ID is content-derived, so an
+// oversized Target/Params would be replicated to every hub verbatim; this caps
+// the payload without affecting any legitimate DeriveID input. Callers apply it
+// on the create path and on mesh catalog ingest so both hold to one standard.
+func Spec(s protocol.CheckSpec) error {
+	if len(s.Target) > maxTargetLen {
+		return fmt.Errorf("%w: target", ErrSpecOversized)
+	}
+	if len(s.Params) > maxParamEntries {
+		return fmt.Errorf("%w: param entries", ErrSpecOversized)
+	}
+	for k, v := range s.Params {
+		if len(k) > maxParamKeyLen || len(v) > maxParamValLen {
+			return fmt.Errorf("%w: param field", ErrSpecOversized)
+		}
 	}
 	return nil
 }

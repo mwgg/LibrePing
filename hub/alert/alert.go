@@ -26,6 +26,21 @@ import (
 // Opener decrypts a sealed destination addressed to this hub (encbox.KeyPair.Open).
 type Opener func(sealed []byte) ([]byte, bool)
 
+const (
+	// downRecencyMS is the floor of the recency window: a probe's latest
+	// observation must be no older than this to count toward corroboration.
+	// Without a recency bound a silent fleet's last "down" would assert an
+	// outage forever (and fire on rule creation), because admission accepts
+	// results up to 24h old. The effective window for a rule is the larger of
+	// this floor and its own ForSeconds grace period, so the down side gets the
+	// same freshness treatment the up side already has.
+	downRecencyMS = int64(15 * 60 * 1000)
+	// evalResultLimit caps how many recent rows are pulled per evaluated check.
+	// The query is already scoped to one check and a recency window, so this is
+	// only a safety ceiling.
+	evalResultLimit = 1000
+)
+
 // Engine evaluates alert rules this hub is responsible for.
 type Engine struct {
 	id              *identity.Identity
@@ -81,13 +96,36 @@ func (e *Engine) Evaluate(ctx context.Context) {
 	for _, p := range peers {
 		live[p] = true
 	}
-	results, err := e.results.Recent(ctx, 1000)
-	if err != nil {
-		e.log.Warn("alert: recent results", "err", err)
-		return
-	}
-	latestByCheck := latestPerProbeByCheck(results)
 	now := e.now().UnixMilli()
+
+	// Per-check recency window: the widest lookback any active rule on that check
+	// needs (its ForSeconds grace period, floored at downRecencyMS). One query per
+	// check is shared by every rule on it, so a busy hub doesn't re-scan.
+	windowByCheck := map[string]int64{}
+	for _, sa := range rules {
+		w := recencyMS(sa.Rule.ForSeconds)
+		if w > windowByCheck[sa.Rule.CheckID] {
+			windowByCheck[sa.Rule.CheckID] = w
+		}
+	}
+	latestCache := map[string]map[string]protocol.ResultContent{}
+	latestFor := func(checkID string) map[string]protocol.ResultContent {
+		if m, ok := latestCache[checkID]; ok {
+			return m
+		}
+		// Query this check's own recent results, not a global newest-N slice: on a
+		// busy hub a global cap can hold zero rows for a quiet check and silently
+		// stop its outage evaluation. The store filters by check_id BEFORE the
+		// limit, so the window is always this check's.
+		res, err := e.results.RecentSinceCheck(ctx, checkID, now-windowByCheck[checkID], 0, evalResultLimit)
+		if err != nil {
+			e.log.Warn("alert: recent results", "check", checkID, "err", err)
+			res = nil
+		}
+		m := latestPerProbe(res)
+		latestCache[checkID] = m
+		return m
+	}
 
 	for _, sa := range rules {
 		rule := sa.Rule
@@ -102,42 +140,50 @@ func (e *Engine) Evaluate(ctx context.Context) {
 		if !ResponsibleAmong(e.self, candidates, rule.ID()) {
 			continue
 		}
-		observed, ok := corroboratedStatus(latestByCheck[rule.CheckID], rule.FailLocations, rule.ForSeconds, now)
+		// This hub is the sole responsible hub for the rule right now, so its own
+		// corroborated view and its own delivered-state are authoritative below.
+		latest := latestFor(rule.CheckID)
+		observed, ok := corroboratedStatus(latest, rule.FailLocations, rule.ForSeconds, now)
 		if !ok {
-			continue // no data yet
+			continue // no fresh data yet
 		}
-		// Compare against what has actually been DELIVERED (locally or by a peer
-		// we learned from via gossip). Anything not yet delivered is (re)tried;
-		// the delivered state only advances on a successful send below.
+		// Own-observation guard: skip only when our OWN corroborated observation
+		// matches what THIS responsible hub last successfully delivered. `observed`
+		// is derived solely from results this hub holds and corroborates, and the
+		// baseline is our own delivery row (see deliveredStatus), so a peer's
+		// gossiped delivery-state can never by itself make us skip a real down
+		// transition (suppress) nor make us re-fire on a false transition (flood).
 		if observed == e.deliveredStatus(ctx, rule) {
 			continue
 		}
-		e.deliver(ctx, rule, observed, latestByCheck[rule.CheckID])
+		e.deliver(ctx, rule, observed, latest)
 	}
 }
 
-// deliveredStatus is the last status known to have been delivered for the rule.
+// deliveredStatus is the authoritative last-delivered status for the rule.
 // Missing state is treated as "up" (the baseline, so we don't alert on a service
 // that's been fine since the rule was created).
 //
-// Only states authored by the rule's recipients are considered — and the newest
-// among them wins. Because delivery state is keyed per (rule, hub), a state from
-// a non-recipient (or any other hub) cannot shadow a recipient's, even if it
-// carries a higher timestamp. This is what keeps failover deduplication honest
-// against a delivery-state poisoning attempt.
+// The currently-responsible hub is authoritative for a rule's delivered-status,
+// and this method is only reached from the responsible hub (Evaluate gates on
+// ResponsibleAmong first), so the authoritative row is THIS hub's own row =
+// exactly what it last successfully sent. States authored by any other recipient
+// are ignored: a non-responsible recipient must not be able to move the baseline,
+// which is the suppress (pre-seed a "down") and flood (flip to "up" each tick)
+// vector. All recipients' states are still stored per (rule, hub) for
+// anti-entropy — only this decision reads the responsible hub's own row.
+//
+// Failover cost: when responsibility moves to a hub with no state yet, its own
+// row is missing → baseline "up" → it may re-notify once. That single duplicate
+// is accepted (the design prioritizes at-least-once/no-loss over no-duplicate in
+// the brief failover window) rather than reopening the suppression hole by
+// trusting a no-longer-responsible hub's state.
 func (e *Engine) deliveredStatus(ctx context.Context, rule protocol.AlertRule) protocol.Status {
-	var newest store.Delivery
-	found := false
-	for hubID := range rule.Recipients {
-		d, ok, _ := e.alerts.GetDeliveryBy(ctx, rule.ID(), hubID)
-		if ok && (!found || d.TimestampMS > newest.TimestampMS) {
-			newest, found = d, true
-		}
-	}
-	if !found {
+	d, ok, _ := e.alerts.GetDeliveryBy(ctx, rule.ID(), e.self)
+	if !ok {
 		return protocol.StatusUp
 	}
-	return newest.Status
+	return d.Status
 }
 
 // deliver decrypts the destination, notifies, and — only on success — records
@@ -202,35 +248,47 @@ func (e *Engine) decrypt(rule protocol.AlertRule) (string, bool) {
 	return string(plain), true
 }
 
-// latestPerProbeByCheck reduces a result list to the newest result per
-// (check_id, probe_id), grouped by check_id.
-func latestPerProbeByCheck(results []protocol.SignedResult) map[string]map[string]protocol.ResultContent {
-	out := map[string]map[string]protocol.ResultContent{}
+// latestPerProbe reduces one check's result list to the newest result per probe.
+func latestPerProbe(results []protocol.SignedResult) map[string]protocol.ResultContent {
+	m := map[string]protocol.ResultContent{}
 	for _, sr := range results {
 		c := sr.Content
-		m := out[c.CheckID]
-		if m == nil {
-			m = map[string]protocol.ResultContent{}
-			out[c.CheckID] = m
-		}
 		if cur, ok := m[c.ProbeID]; !ok || c.TimestampMS > cur.TimestampMS {
 			m[c.ProbeID] = c
 		}
 	}
-	return out
+	return m
+}
+
+// recencyMS is the freshness window a rule with the given ForSeconds uses: its
+// grace period, floored at downRecencyMS. An observation older than this is
+// ignored, so neither a stale "down" nor a stale "up" can drive a decision.
+func recencyMS(forSeconds int) int64 {
+	w := int64(forSeconds) * 1000
+	if w < downRecencyMS {
+		w = downRecencyMS
+	}
+	return w
 }
 
 // corroboratedStatus decides a check's status from the latest result per probe.
+// Only observations within the recency window (recencyMS(forSeconds)) count, so
+// a silent fleet asserts neither state — it reads as "no fresh data" and the
+// rule is skipped, leaving the last delivered status untouched. This gives the
+// "down" side the same freshness guarantee the "up" side already had.
 func corroboratedStatus(latest map[string]protocol.ResultContent, failLocations, forSeconds int, nowMS int64) (protocol.Status, bool) {
-	if len(latest) == 0 {
-		return "", false
-	}
 	if failLocations < 1 {
 		failLocations = 1
 	}
+	recency := recencyMS(forSeconds)
 	down := 0
 	var newestUp int64
+	fresh := false
 	for _, c := range latest {
+		if nowMS-c.TimestampMS > recency {
+			continue // stale: cannot assert up or down
+		}
+		fresh = true
 		switch c.Status {
 		case protocol.StatusDown:
 			down++
@@ -239,6 +297,9 @@ func corroboratedStatus(latest map[string]protocol.ResultContent, failLocations,
 				newestUp = c.TimestampMS
 			}
 		}
+	}
+	if !fresh {
+		return "", false
 	}
 	downCorroborated := down >= failLocations && (newestUp == 0 || nowMS-newestUp >= int64(forSeconds)*1000)
 	if downCorroborated {

@@ -14,13 +14,22 @@ func TestIsBlockedIP(t *testing.T) {
 		"169.254.169.254", "fd00:ec2::254", // cloud metadata
 		"0.0.0.0", "::", // unspecified
 		"224.0.0.1", // multicast
+		// Additional non-public ranges (blockedCIDRs).
+		"100.64.0.1", "100.127.255.255", // RFC 6598 CGNAT / tailnet
+		"192.0.0.1",                    // IETF protocol assignments
+		"198.18.0.1", "198.19.255.255", // benchmarking
+		"255.255.255.255",   // limited broadcast
+		"0.1.2.3",           // 0.0.0.0/8 this-network
+		"64:ff9b::7f00:1",   // NAT64 embedding 127.0.0.1
+		"fec0::1",           // deprecated site-local
+		"::ffff:100.64.0.1", // IPv4-mapped-IPv6 form of a CGNAT address
 	}
 	for _, s := range blocked {
 		if !IsBlockedIP(net.ParseIP(s)) {
 			t.Errorf("expected %s to be blocked", s)
 		}
 	}
-	allowed := []string{"8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"}
+	allowed := []string{"8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111", "100.63.255.255", "100.128.0.1"}
 	for _, s := range allowed {
 		if IsBlockedIP(net.ParseIP(s)) {
 			t.Errorf("expected %s to be allowed", s)

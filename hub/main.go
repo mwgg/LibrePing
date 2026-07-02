@@ -18,6 +18,10 @@
 //	                   live, self-maintaining list of dialable peers to join
 //	HUB_ALLOW_PRIVATE_PEERS  allow directory checks to reach private IPs (default false)
 //	WRITE_RATE_PER_MIN per-IP rate limit on write endpoints     (0 = default)
+//	RESULT_RATE_PER_MIN per-IP rate limit on result submission  (0 = default, generous)
+//	READ_RATE_PER_MIN  per-IP rate limit on holder read/query   (0 = default)
+//	TRUST_PROXY_HEADERS honor X-Forwarded-For/X-Real-IP for rate-limit keying;
+//	                   enable only behind a trusted reverse proxy (default false)
 //	ALERT_WEBHOOK_ALLOW_HTTP allow plain-http webhook destinations (default false)
 //	DATABASE_URL       Postgres/TimescaleDB DSN; empty = in-memory store
 //	MIGRATIONS_DIR     directory of *.sql migrations            (default ./migrations)
@@ -42,6 +46,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -155,7 +160,22 @@ func main() {
 			}
 		},
 		IngestCatalog: func(ctx context.Context, sc protocol.SignedCatalogEntry) {
+			// Bound the free-form spec fields the same way the create path does,
+			// so a gossiped entry with an oversized Target/Params isn't stored and
+			// re-broadcast network-wide.
+			if err := admit.Spec(sc.Entry.Spec); err != nil {
+				log.Debug("dropping oversized gossiped catalog entry", "check_id", sc.Entry.Spec.ID, "err", err)
+				return
+			}
 			if err := catalogStore.UpsertCheck(ctx, sc); err != nil {
+				if errors.Is(err, store.ErrCatalogConflict) {
+					// A different spec already owns this content-derived ID (a
+					// collision or a crafted twin). Keep the stored entry; do not
+					// overwrite it, and — since it isn't stored — the anti-entropy
+					// gossipLoop won't re-broadcast the impostor either.
+					log.Warn("rejected conflicting catalog entry", "check_id", sc.Entry.Spec.ID)
+					return
+				}
 				log.Warn("store gossiped catalog entry", "err", err)
 			}
 		},
@@ -245,6 +265,9 @@ func main() {
 		Policy:            policy,
 		Redundancy:        atoiDefault(os.Getenv("TARGET_REDUNDANCY"), 3),
 		WriteRatePerMin:   atoiDefault(os.Getenv("WRITE_RATE_PER_MIN"), 0),
+		ResultRatePerMin:  atoiDefault(os.Getenv("RESULT_RATE_PER_MIN"), 0),
+		ReadRatePerMin:    atoiDefault(os.Getenv("READ_RATE_PER_MIN"), 0),
+		TrustProxyHeaders: boolDefault(os.Getenv("TRUST_PROXY_HEADERS"), false),
 		MeshDiagnostics:   func() any { return mesh.Diagnostics() },
 		SelfAddrs:         mesh.PublicAddrs,
 		SelfLocation:      selfLoc,
@@ -351,10 +374,18 @@ func main() {
 		alertNotifiers(boolDefault(os.Getenv("ALERT_WEBHOOK_ALLOW_HTTP"), false)), log)
 	go engine.Run(ctx, durDefault(os.Getenv("ALERT_INTERVAL"), 30*time.Second))
 
+	// Full server timeouts so a slow or idle client can't hold a connection
+	// open indefinitely (slowloris). No handler streams or long-polls — the
+	// heaviest response is a bounded results/query (≤5000 rows) — so a generous
+	// but finite WriteTimeout covers every legitimate response without cutting
+	// one off. Reads are all small JSON bodies, hence a tight ReadTimeout.
 	httpSrv := &http.Server{
 		Addr:              env("HTTP_ADDR", ":8080"),
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
 		log.Info("hub API listening", "addr", httpSrv.Addr)
@@ -431,6 +462,13 @@ func openStores(ctx context.Context, log *slog.Logger) (store.ResultStore, store
 		RawRetentionDays:    atoiDefault(os.Getenv("RESULT_RETENTION_DAYS"), def.RawRetentionDays),
 		HourlyRetentionDays: atoiDefault(os.Getenv("RESULT_HOURLY_RETENTION_DAYS"), def.HourlyRetentionDays),
 		DailyRetentionDays:  atoiDefault(os.Getenv("RESULT_DAILY_RETENTION_DAYS"), def.DailyRetentionDays),
+	}
+	// Clamp retention up to the minimums that keep the rollups whole; a too-short
+	// raw/hourly retention would drop rows before they're summarized, silently
+	// gapping the hourly/daily history. Warn so the operator sees the adjustment.
+	tier, tierWarnings := tier.SafeClamp()
+	for _, warn := range tierWarnings {
+		log.Warn("result storage retention adjusted", "reason", warn)
 	}
 	if err := pg.ConfigureResultTiers(ctx, tier); err != nil {
 		log.Error("configure result storage tiers (continuing without full tiering)", "err", err)

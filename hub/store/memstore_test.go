@@ -75,6 +75,33 @@ func TestHistoryRangeBuckets(t *testing.T) {
 	}
 }
 
+// TestMemStoreEvictsOldestAndReclaimsSeen proves the unbounded-growth fix: past
+// the ring cap the oldest results are evicted and their dedupe keys reclaimed, so
+// len(seen) tracks len(all) rather than growing forever.
+func TestMemStoreEvictsOldestAndReclaimsSeen(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	total := memStoreMaxResults + memStoreEvictBatch + 5
+	for i := 0; i < total; i++ {
+		_ = m.Insert(ctx, res("c", int64(i)))
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.all) > memStoreMaxResults {
+		t.Fatalf("ring not bounded: len(all)=%d > cap=%d", len(m.all), memStoreMaxResults)
+	}
+	if len(m.seen) != len(m.all) {
+		t.Fatalf("seen not reclaimed with all: seen=%d all=%d", len(m.seen), len(m.all))
+	}
+	// Oldest key must be gone; a recent key must remain.
+	if _, ok := m.seen[dedupeKey(res("c", 0).Content)]; ok {
+		t.Fatal("oldest dedupe key was not evicted")
+	}
+	if _, ok := m.seen[dedupeKey(res("c", int64(total-1)).Content)]; !ok {
+		t.Fatal("newest dedupe key missing after eviction")
+	}
+}
+
 func TestRecentSinceShardAndBefore(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()

@@ -2,6 +2,7 @@ package admit
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +67,56 @@ func TestResultAdmission(t *testing.T) {
 	big.Target = strings.Repeat("a", maxTargetLen+1)
 	if err := Result(context.Background(), stubCatalog{}, sign(t, big), now); err == nil {
 		t.Fatal("expected oversized target rejection")
+	}
+}
+
+func TestResultOversizedIdentifiers(t *testing.T) {
+	now := time.UnixMilli(1_700_000_000_000)
+	base := protocol.ResultContent{
+		CheckID: "c1", CheckType: protocol.CheckHTTP, Target: "https://example.com",
+		Status: protocol.StatusUp, TimestampMS: now.UnixMilli(),
+	}
+
+	// Over-long CheckID → rejected (attacker-chosen free-form field).
+	longCheck := base
+	longCheck.CheckID = strings.Repeat("a", maxIDLen+1)
+	if err := Result(context.Background(), stubCatalog{}, sign(t, longCheck), now); err == nil {
+		t.Fatal("expected oversized CheckID rejection")
+	}
+
+	// A normal 16-char check ID is fine.
+	base.CheckID = "abcd1234abcd1234"
+	if err := Result(context.Background(), stubCatalog{}, sign(t, base), now); err != nil {
+		t.Fatalf("normal CheckID rejected: %v", err)
+	}
+}
+
+func TestSpecBounds(t *testing.T) {
+	// A normal spec passes.
+	ok := protocol.CheckSpec{Type: protocol.CheckHTTP, Target: "https://example.com", Params: map[string]string{"method": "GET"}}
+	if err := Spec(ok); err != nil {
+		t.Fatalf("normal spec rejected: %v", err)
+	}
+
+	// Oversized target rejected.
+	bigTarget := protocol.CheckSpec{Type: protocol.CheckHTTP, Target: strings.Repeat("a", maxTargetLen+1)}
+	if err := Spec(bigTarget); err == nil {
+		t.Fatal("expected oversized target rejection")
+	}
+
+	// Too many params rejected.
+	manyParams := protocol.CheckSpec{Type: protocol.CheckHTTP, Target: "https://x", Params: map[string]string{}}
+	for i := 0; i < maxParamEntries+1; i++ {
+		manyParams.Params[strconv.Itoa(i)] = "v"
+	}
+	if err := Spec(manyParams); err == nil {
+		t.Fatal("expected too-many-params rejection")
+	}
+
+	// Oversized param value rejected.
+	bigParam := protocol.CheckSpec{Type: protocol.CheckHTTP, Target: "https://x", Params: map[string]string{"k": strings.Repeat("b", maxParamValLen+1)}}
+	if err := Spec(bigParam); err == nil {
+		t.Fatal("expected oversized param value rejection")
 	}
 }
 

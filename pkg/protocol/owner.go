@@ -148,35 +148,48 @@ func (a AlertRule) ID() string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// canonicalRecipients renders the sealed-destination map deterministically
-// (hub IDs sorted) so the signature is reproducible in any language.
-func (a AlertRule) canonicalRecipients() string {
+// canonical builds the byte string an owner signs for an AlertRule.
+//
+// Every variable-length field is length-prefixed as "<byteLen>:<bytes>" and the
+// fields are concatenated with no separator (the same injective encoding as
+// CheckSpec.DeriveID). Newline-joining free-form fields — as the earlier v3
+// encoding did — was ambiguous: because CheckID, Channel, DestHash and the
+// recipient entries are all attacker-influenced (hub-supplied IDs and checkIds
+// flow into what the browser signs), a value containing "\n", ":" or "," could
+// shift a delimiter so two distinct rules produced identical signed bytes, and
+// one signature verified both. Length-prefixing removes that: a separator inside
+// a value can no longer be confused for a field boundary. The recipient count is
+// written before the entries so the map's extent is unambiguous too. Hub IDs are
+// sorted so the encoding is reproducible in any language.
+func (a AlertRule) canonical() []byte {
 	ids := make([]string, 0, len(a.Recipients))
 	for id := range a.Recipients {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	parts := make([]string, 0, len(ids))
-	for _, id := range ids {
-		parts = append(parts, id+":"+a.Recipients[id])
-	}
-	return strings.Join(parts, ",")
-}
 
-func (a AlertRule) canonical() []byte {
-	return []byte(strings.Join([]string{
-		"libreping-alert-v3",
-		a.Owner,
-		a.CheckID,
-		string(a.Channel),
-		a.DestHash,
-		a.canonicalRecipients(),
-		strconv.Itoa(a.FailLocations),
-		strconv.Itoa(a.ForSeconds),
-		strconv.FormatInt(a.ExpiryMS, 10),
-		strconv.FormatInt(a.UpdatedMS, 10),
-		boolField(a.Deleted),
-	}, "\n"))
+	var b strings.Builder
+	b.WriteString("libreping-alert-v4\n")
+	writeField := func(v string) {
+		b.WriteString(strconv.Itoa(len(v)))
+		b.WriteByte(':')
+		b.WriteString(v)
+	}
+	writeField(a.Owner)
+	writeField(a.CheckID)
+	writeField(string(a.Channel))
+	writeField(a.DestHash)
+	writeField(strconv.Itoa(len(ids)))
+	for _, id := range ids {
+		writeField(id)
+		writeField(a.Recipients[id])
+	}
+	writeField(strconv.Itoa(a.FailLocations))
+	writeField(strconv.Itoa(a.ForSeconds))
+	writeField(strconv.FormatInt(a.ExpiryMS, 10))
+	writeField(strconv.FormatInt(a.UpdatedMS, 10))
+	writeField(boolField(a.Deleted))
+	return []byte(b.String())
 }
 
 // SignedAlertRule is an AlertRule plus the owner's key and signature.

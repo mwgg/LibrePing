@@ -18,6 +18,15 @@ type PgCatalog struct {
 func NewPgCatalog(s *PgStore) *PgCatalog { return &PgCatalog{pool: s.pool} }
 
 func (c *PgCatalog) UpsertCheck(ctx context.Context, sc protocol.SignedCatalogEntry) error {
+	// Guard against a content-ID collision before writing: if a different spec
+	// already holds this ID (an 8-byte sha256 collision or a crafted twin),
+	// keep the first writer and reject rather than let ON CONFLICT overwrite it.
+	// An identical spec still falls through and refreshes the row (idempotent).
+	if existing, ok, err := c.GetCheck(ctx, sc.Entry.Spec.ID); err != nil {
+		return err
+	} else if ok && !sameCheckContent(existing.Entry.Spec, sc.Entry.Spec) {
+		return ErrCatalogConflict
+	}
 	params, err := json.Marshal(sc.Entry.Spec.Params)
 	if err != nil {
 		return err

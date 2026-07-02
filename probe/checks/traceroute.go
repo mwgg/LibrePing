@@ -43,13 +43,14 @@ func (TracerouteChecker) Run(ctx context.Context, spec protocol.CheckSpec) (Outc
 	}
 	defer conn.Close()
 
+	probe := newICMPProbe()
 	var hops []string
 	reached := false
 	for ttl := 1; ttl <= maxHops; ttl++ {
 		if ctx.Err() != nil {
 			break
 		}
-		hop, rtt, typ, err := pingOnce(conn, privileged, ipAddr.IP, ttl, ttl, perHop)
+		hop, rtt, typ, err := pingOnce(conn, privileged, probe, ipAddr.IP, ttl, ttl, perHop)
 		switch {
 		case err != nil:
 			hops = append(hops, fmt.Sprintf("%d:*", ttl))

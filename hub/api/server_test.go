@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,6 +145,35 @@ func TestChecksEndpointReturnsAssignment(t *testing.T) {
 	}
 	if got := assignedTo(srv, "nobody"); len(got) != 0 {
 		t.Fatalf("unknown probe should get no checks, got %v", got)
+	}
+}
+
+func TestRegisterFloorsZeroCapacity(t *testing.T) {
+	// A probe declaring MaxChecksPerMinute: 0 must not end up with the assigner's
+	// "unlimited" semantic (Capacity <= 0). handleRegister floors it to a finite
+	// positive value so a signed registration can't soak up every assignment slot.
+	hubID, _ := identity.Generate()
+	srv := New(Config{Store: store.NewMemStore(), Identity: hubID, Redundancy: 1})
+
+	probe, _ := identity.Generate()
+	for _, declared := range []int{0, -5} {
+		signedReg, _ := protocol.SignProbeRegistration(probe, protocol.ProbeRegistration{
+			MaxChecksPerMinute: declared,
+			SupportedTypes:     []protocol.CheckType{protocol.CheckHTTP},
+			TimestampMS:        time.Now().UnixMilli(),
+		})
+		reg := do(srv, http.MethodPost, "/api/v1/probes/register", signedReg)
+		if reg.Code != http.StatusOK {
+			t.Fatalf("register (declared=%d): %d %s", declared, reg.Code, reg.Body.String())
+		}
+		probes := srv.liveProbes()
+		if len(probes) != 1 {
+			t.Fatalf("expected 1 live probe, got %d", len(probes))
+		}
+		if probes[0].Capacity < minDeclaredCapacity {
+			t.Fatalf("declared=%d yielded capacity %d, want >= %d (finite, not unlimited)",
+				declared, probes[0].Capacity, minDeclaredCapacity)
+		}
 	}
 }
 
@@ -325,6 +355,79 @@ func TestNonHolderSubmitPushesToHolder(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("holder never received the directly-pushed result")
+}
+
+// TestSubmitRejectsOversizedBody proves the body cap: a POST larger than the
+// per-request limit returns 413 (not a 500) and nothing is stored — the body is
+// refused before it is fully buffered and decoded.
+func TestSubmitRejectsOversizedBody(t *testing.T) {
+	srv, st := newTestServer()
+	// A syntactically-plausible but enormous JSON body: a Target padded well past
+	// the maxBodyBytes cap. It must be rejected before allocation/decode.
+	huge := strings.Repeat("a", maxBodyBytes+1024)
+	body := []byte(`{"content":{"target":"` + huge + `"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/results", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body: expected 413, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if stored, _ := st.Recent(context.Background(), 10); len(stored) != 0 {
+		t.Fatalf("oversized submission was stored (%d results)", len(stored))
+	}
+}
+
+// TestCreateCheckRejectsOversizedBody proves the cap applies to the catalog
+// create path too, so an oversized spec never reaches signing/gossip.
+func TestCreateCheckRejectsOversizedBody(t *testing.T) {
+	hubID, _ := identity.Generate()
+	srv := New(Config{Store: store.NewMemStore(), Identity: hubID})
+	huge := strings.Repeat("a", maxBodyBytes+1024)
+	body := []byte(`{"type":"http","target":"https://` + huge + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/checks", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized check body: expected 413, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateCheckRejectsOversizedTarget proves the spec field bound: a Target
+// within the body cap but over the per-field limit is rejected with 400 before
+// it is signed and gossiped network-wide.
+func TestCreateCheckRejectsOversizedTarget(t *testing.T) {
+	hubID, _ := identity.Generate()
+	srv := New(Config{Store: store.NewMemStore(), Identity: hubID})
+	// Under the 64 KiB body cap, but over admit's Target bound.
+	target := "https://" + strings.Repeat("a", 4096)
+	rec := do(srv, http.MethodPost, "/api/v1/checks", map[string]any{"type": "http", "target": target})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized target: expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	cat := do(srv, http.MethodGet, "/api/v1/catalog", nil)
+	var specs []protocol.CheckSpec
+	_ = json.Unmarshal(cat.Body.Bytes(), &specs)
+	if len(specs) != 0 {
+		t.Fatalf("oversized-target check was stored: %v", specs)
+	}
+}
+
+// TestSubmitStillAcceptsNormalBody guards against the cap breaking legitimate
+// use: an ordinary signed result still succeeds.
+func TestSubmitStillAcceptsNormalBody(t *testing.T) {
+	srv, st := newTestServer()
+	probe, _ := identity.Generate()
+	sr, _ := protocol.SignResult(probe, protocol.ResultContent{
+		CheckID: "c1", CheckType: protocol.CheckHTTP, Target: "https://example.com",
+		Status: protocol.StatusUp, TimestampMS: time.Now().UnixMilli(),
+	})
+	if rec := submit(srv, sr); rec.Code != http.StatusAccepted {
+		t.Fatalf("normal submit: expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if stored, _ := st.Recent(context.Background(), 10); len(stored) != 1 {
+		t.Fatalf("normal result not stored, got %d", len(stored))
+	}
 }
 
 func assignedTo(srv *Server, probeID string) []protocol.CheckSpec {

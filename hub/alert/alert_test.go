@@ -4,14 +4,21 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mwgg/libreping/hub/encbox"
 	"github.com/mwgg/libreping/hub/store"
 	"github.com/mwgg/libreping/pkg/identity"
 	"github.com/mwgg/libreping/pkg/protocol"
 )
+
+// testNowMS is the fixed "now" the engine sees in tests. Result timestamps are
+// expressed relative to it so they land inside the freshness window regardless
+// of wall-clock time when the test runs.
+const testNowMS = int64(1_700_000_000_000)
 
 func TestResponsibleAmongExactlyOneWinner(t *testing.T) {
 	candidates := []string{"hubA", "hubB", "hubC"}
@@ -101,7 +108,142 @@ func engineFixture(t *testing.T, notifier Notifier) (*Engine, *store.MemAlerts, 
 	eng := NewEngine(hubID, alerts, results, func() []string { return nil }, enc.Open,
 		func(context.Context, protocol.SignedDeliveryState) {},
 		map[protocol.AlertChannel]Notifier{protocol.AlertWebhook: notifier}, nil)
+	eng.now = func() time.Time { return time.UnixMilli(testNowMS) }
 	return eng, alerts, results, rule
+}
+
+// losingPeer returns a hub ID that loses the rendezvous for key to self, so that
+// among {self, peer} this hub is the responsible one. That lets a test cast the
+// peer as a NON-responsible recipient (the delivery-state poisoning attacker).
+func losingPeer(t *testing.T, self, key string) string {
+	t.Helper()
+	for i := 0; i < 100000; i++ {
+		cand := fmt.Sprintf("peer-hub-%d", i)
+		if ResponsibleAmong(self, []string{self, cand}, key) {
+			return cand
+		}
+	}
+	t.Fatal("could not find a peer that loses rendezvous to self")
+	return ""
+}
+
+// twoRecipientFixture wires an engine that is one of TWO live recipients and is
+// the responsible one; peer is the other (non-responsible) recipient.
+func twoRecipientFixture(t *testing.T, notifier Notifier) (*Engine, *store.MemAlerts, *store.MemStore, protocol.AlertRule, string) {
+	t.Helper()
+	hubID, _ := identity.Generate()
+	enc := encbox.FromSeed(hubID.Seed())
+	sealed, _ := encbox.Seal([]byte("https://hook"), enc.PublicKey())
+
+	rule := protocol.AlertRule{
+		Owner: "owner1", CheckID: "chk", Channel: protocol.AlertWebhook,
+		DestHash:      "deadbeef",
+		FailLocations: 2, ForSeconds: 0,
+	}
+	peer := losingPeer(t, hubID.NodeID(), rule.ID())
+	rule.Recipients = map[string]string{
+		hubID.NodeID(): base64.StdEncoding.EncodeToString(sealed),
+		peer:           base64.StdEncoding.EncodeToString([]byte("sealed-to-peer")),
+	}
+
+	alerts := store.NewMemAlerts()
+	results := store.NewMemStore()
+	_ = alerts.Upsert(context.Background(), protocol.SignedAlertRule{Rule: rule})
+
+	eng := NewEngine(hubID, alerts, results, func() []string { return []string{peer} }, enc.Open,
+		func(context.Context, protocol.SignedDeliveryState) {},
+		map[protocol.AlertChannel]Notifier{protocol.AlertWebhook: notifier}, nil)
+	eng.now = func() time.Time { return time.UnixMilli(testNowMS) }
+	return eng, alerts, results, rule, peer
+}
+
+// A delivery-state pre-seeded by a NON-responsible recipient must not suppress a
+// genuine down alert on the responsible hub (the "suppress" poisoning vector).
+func TestPoisonedStateDoesNotSuppressRealDown(t *testing.T) {
+	ctx := context.Background()
+	nf := &flakyNotifier{}
+	eng, alerts, results, rule, peer := twoRecipientFixture(t, nf)
+
+	// The attacker (a recipient, but NOT the responsible hub) gossips a "down"
+	// delivery-state BEFORE any real outage, hoping the responsible hub sees
+	// delivered==down==observed and skips the genuine alert.
+	_, _ = alerts.MergeDelivery(ctx, rule.ID(), store.Delivery{Status: protocol.StatusDown, HubID: peer, TimestampMS: testNowMS})
+
+	// Now a real outage happens.
+	_ = results.Insert(ctx, downResult("chk", "pa", testNowMS-2000))
+	_ = results.Insert(ctx, downResult("chk", "pb", testNowMS-2000))
+
+	eng.Evaluate(ctx)
+	if nf.count() != 1 {
+		t.Fatalf("non-responsible recipient's down state must not suppress a real alert; got %d deliveries", nf.count())
+	}
+}
+
+// A flood of fresh "up" states from a NON-responsible recipient during a genuine
+// outage must not make the responsible hub re-fire each tick (the "flood" vector).
+func TestPoisonedUpFloodDoesNotRefire(t *testing.T) {
+	ctx := context.Background()
+	nf := &flakyNotifier{}
+	eng, alerts, results, rule, peer := twoRecipientFixture(t, nf)
+
+	// Genuine, sustained outage.
+	_ = results.Insert(ctx, downResult("chk", "pa", testNowMS-2000))
+	_ = results.Insert(ctx, downResult("chk", "pb", testNowMS-2000))
+
+	// First tick fires once and records this hub's own delivered==down.
+	eng.Evaluate(ctx)
+	if nf.count() != 1 {
+		t.Fatalf("expected the genuine down to fire once, got %d", nf.count())
+	}
+
+	// The attacker floods fresh "up" states each tick, trying to reset the
+	// baseline so the down re-fires. The responsible hub reads only its OWN row.
+	for i := 0; i < 5; i++ {
+		_, _ = alerts.MergeDelivery(ctx, rule.ID(), store.Delivery{Status: protocol.StatusUp, HubID: peer, TimestampMS: testNowMS + int64(i)})
+		eng.Evaluate(ctx)
+	}
+	if nf.count() != 1 {
+		t.Fatalf("non-responsible recipient's up flood must not cause re-fire; got %d deliveries", nf.count())
+	}
+}
+
+// A check with zero rows in a global newest-N slice (because other checks are
+// busier) must still evaluate: the per-check query gives it its own window.
+func TestQuietCheckOutsideGlobalWindowStillEvaluates(t *testing.T) {
+	ctx := context.Background()
+	nf := &flakyNotifier{}
+	eng, _, results, _ := engineFixture(t, nf)
+
+	// Flood the store with newest results for OTHER checks: a global Recent(1000)
+	// would return only these and never see "chk".
+	for i := 0; i < 1500; i++ {
+		_ = results.Insert(ctx, upResult(fmt.Sprintf("busy-%d", i), "px", testNowMS-int64(i)))
+	}
+	// The monitored check is down, but its rows are older than the busy noise.
+	_ = results.Insert(ctx, downResult("chk", "pa", testNowMS-5000))
+	_ = results.Insert(ctx, downResult("chk", "pb", testNowMS-5000))
+
+	eng.Evaluate(ctx)
+	if nf.count() != 1 {
+		t.Fatalf("a quiet check pushed out of a global window must still fire; got %d", nf.count())
+	}
+}
+
+// Stale-only down observations (older than the recency window) must not assert an
+// outage — so a silent fleet's last "down" can't fire, including on rule creation.
+func TestStaleDownDoesNotFire(t *testing.T) {
+	ctx := context.Background()
+	nf := &flakyNotifier{}
+	eng, _, results, _ := engineFixture(t, nf)
+
+	stale := testNowMS - (downRecencyMS + 60*1000) // comfortably beyond the window
+	_ = results.Insert(ctx, downResult("chk", "pa", stale))
+	_ = results.Insert(ctx, downResult("chk", "pb", stale))
+
+	eng.Evaluate(ctx)
+	if nf.count() != 0 {
+		t.Fatalf("stale-only down must not assert an outage; got %d deliveries", nf.count())
+	}
 }
 
 func TestEngineRetriesThenDeliversOnceThenRecovers(t *testing.T) {
@@ -109,8 +251,8 @@ func TestEngineRetriesThenDeliversOnceThenRecovers(t *testing.T) {
 	nf := &flakyNotifier{fail: true}
 	eng, _, results, _ := engineFixture(t, nf)
 
-	_ = results.Insert(ctx, downResult("chk", "pa", 100))
-	_ = results.Insert(ctx, downResult("chk", "pb", 100))
+	_ = results.Insert(ctx, downResult("chk", "pa", testNowMS-2000))
+	_ = results.Insert(ctx, downResult("chk", "pb", testNowMS-2000))
 
 	// Delivery fails → nothing recorded, so it must be retried (not lost).
 	eng.Evaluate(ctx)
@@ -135,8 +277,8 @@ func TestEngineRetriesThenDeliversOnceThenRecovers(t *testing.T) {
 	}
 
 	// Service recovers → one more delivery (the "up" transition).
-	_ = results.Insert(ctx, upResult("chk", "pa", 200))
-	_ = results.Insert(ctx, upResult("chk", "pb", 200))
+	_ = results.Insert(ctx, upResult("chk", "pa", testNowMS-1000))
+	_ = results.Insert(ctx, upResult("chk", "pb", testNowMS-1000))
 	eng.Evaluate(ctx)
 	if nf.count() != 2 || nf.n[1].Status != protocol.StatusUp {
 		t.Fatalf("expected recovery delivery, got %d", nf.count())
@@ -148,8 +290,8 @@ func TestInheritedDeliveryStateSuppressesDuplicate(t *testing.T) {
 	nf := &flakyNotifier{}
 	eng, alerts, results, rule := engineFixture(t, nf)
 
-	_ = results.Insert(ctx, downResult("chk", "pa", 100))
-	_ = results.Insert(ctx, downResult("chk", "pb", 100))
+	_ = results.Insert(ctx, downResult("chk", "pa", testNowMS-2000))
+	_ = results.Insert(ctx, downResult("chk", "pb", testNowMS-2000))
 
 	// Simulate a delivery already done by a recipient hub (this hub's own ID, as
 	// if learned via gossip / restart): the engine must not re-deliver.
@@ -165,8 +307,8 @@ func TestDeliveryStateFromNonRecipientIgnored(t *testing.T) {
 	nf := &flakyNotifier{}
 	eng, alerts, results, rule := engineFixture(t, nf)
 
-	_ = results.Insert(ctx, downResult("chk", "pa", 100))
-	_ = results.Insert(ctx, downResult("chk", "pb", 100))
+	_ = results.Insert(ctx, downResult("chk", "pa", testNowMS-2000))
+	_ = results.Insert(ctx, downResult("chk", "pb", testNowMS-2000))
 
 	// A delivery-state authored by a hub NOT in the rule's recipients must be
 	// ignored, so it cannot suppress a real alert.
@@ -185,8 +327,8 @@ func TestFutureStrangerStateCannotShadow(t *testing.T) {
 	nf := &flakyNotifier{}
 	eng, alerts, results, rule := engineFixture(t, nf)
 
-	_ = results.Insert(ctx, downResult("chk", "pa", 100))
-	_ = results.Insert(ctx, downResult("chk", "pb", 100))
+	_ = results.Insert(ctx, downResult("chk", "pa", testNowMS-2000))
+	_ = results.Insert(ctx, downResult("chk", "pb", testNowMS-2000))
 
 	// The legitimate recipient (this hub) has already delivered "down".
 	_, _ = alerts.MergeDelivery(ctx, rule.ID(), store.Delivery{Status: protocol.StatusDown, HubID: eng.self, TimestampMS: 50})

@@ -41,6 +41,43 @@ func TestAlertRuleSignVerifyTamper(t *testing.T) {
 	}
 }
 
+// TestAlertRuleCanonicalNoCollision proves the v4 length-prefixed encoding is
+// injective where the old newline/":"/"," joining was ambiguous. Each pair below
+// canonicalized to identical bytes under v3 (so one signature verified both);
+// under v4 they must differ, and a signature over one must not verify the other.
+func TestAlertRuleCanonicalNoCollision(t *testing.T) {
+	owner, _ := identity.Generate()
+	pairs := [][2]AlertRule{
+		// Free-form fields shifting across the delimiter: "x" + "\n" + "w\nD"
+		// vs "x\nw" + "\n" + "D" newline-join to the same string.
+		{
+			{CheckID: "x", Channel: "w\nD", DestHash: "R"},
+			{CheckID: "x\nw", Channel: "D", DestHash: "R"},
+		},
+		// Recipient entries: {"a":"x,b:y"} vs {"a":"x","b":"y"} both render to
+		// "a:x,b:y" when entries are ":"-paired and ","-joined.
+		{
+			{CheckID: "c", Channel: AlertWebhook, DestHash: "R",
+				Recipients: map[string]string{"a": "x,b:y"}},
+			{CheckID: "c", Channel: AlertWebhook, DestHash: "R",
+				Recipients: map[string]string{"a": "x", "b": "y"}},
+		},
+	}
+	for i, p := range pairs {
+		a, b := p[0], p[1]
+		if string(a.canonical()) == string(b.canonical()) {
+			t.Fatalf("pair %d: distinct rules produced identical canonical bytes", i)
+		}
+		sa := SignAlertRule(owner, a)
+		// A signature over a must not verify b (swap the rule, keep the sig).
+		forged := SignedAlertRule{Rule: b, PubKey: sa.PubKey, Signature: sa.Signature}
+		forged.Rule.Owner = sa.Rule.Owner
+		if err := forged.Verify(); err == nil {
+			t.Fatalf("pair %d: signature over one rule verified a distinct rule", i)
+		}
+	}
+}
+
 // fixedSeed is a deterministic key used only for the cross-language vectors.
 var fixedSeed = []byte{
 	1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
@@ -79,7 +116,7 @@ func TestCrossLanguageVectors(t *testing.T) {
 	// its own test; both must match. Regenerate together if canonical() changes.
 	const wantNodeID = "65b60673d6ed884bf01c2c222d82ada0"
 	const wantSubSig = "dc079b7fbb2a61ca1ab313ff294fc769242d118665dd189626aa7bbbde0ae444b8f97baf7bcf54170359a4d6d5a2b5982745a231072e48a5dce7d2bc2024440d"
-	const wantRuleSig = "40d2789a8d22310d763453a2c02c134b4ff2e3a9d45478644a80ac623949a201195e636dcded214f03601c210bffd0839077131a978e77efc4154f29fbbe6c0a"
+	const wantRuleSig = "bb1690db21e7722cd6bd27e25fe345549fcd31d4174cbdcb07ffe8a7de01c16c188a7b397583436ad64f5f9982b2dd6baf09c5d5615e042974f181667e53c702"
 	if id.NodeID() != wantNodeID {
 		t.Fatalf("node id drifted: got %s want %s", id.NodeID(), wantNodeID)
 	}

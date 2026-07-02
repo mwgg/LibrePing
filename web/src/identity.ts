@@ -23,7 +23,7 @@ const STORAGE_KEY = "libreping_seed_hex";
 export interface Identity {
   seed: Uint8Array; // 32-byte Ed25519 seed
   pub: Uint8Array; // 32-byte public key
-  owner: string; // node ID = hex(sha256(pub)[:8]) — matches Go identity.NodeIDFromPub
+  owner: string; // node ID = hex(sha256(pub)[:16]) — 16 bytes, matches Go identity.NodeIDFromPub
 }
 
 export function fromSeed(seed: Uint8Array): Identity {
@@ -183,24 +183,32 @@ export function signAlertRule(id: Identity, a: AlertInput, hubs: HubKey[]) {
       recipients[h.hubId] = sealTo(h.encPubKey, a.destination);
     }
   }
-  const recipientsCanonical = Object.keys(recipients)
-    .sort()
-    .map((k) => k + ":" + recipients[k])
-    .join(",");
-
-  const canonical = [
-    "libreping-alert-v3",
-    id.owner,
-    a.checkId,
-    a.channel,
-    destHash,
-    recipientsCanonical,
-    String(a.failLocations),
-    String(a.forSeconds),
-    String(a.expiryMs),
-    String(a.updatedMs),
-    a.deleted ? "1" : "0",
-  ].join("\n");
+  // Length-prefixed, injective encoding — must byte-match Go's
+  // AlertRule.canonical (owner.go). Each field is written as "<byteLen>:<bytes>"
+  // (byteLen is the UTF-8 byte length, NOT the UTF-16 code-unit count that
+  // String.length returns) and the fields are concatenated with no separator, so
+  // a ":" / "," / "\n" inside any hub-supplied value cannot forge a field
+  // boundary. The recipient count precedes the entries so the map is unambiguous.
+  const enc = new TextEncoder();
+  const field = (v: string) => enc.encode(v).length + ":" + v;
+  const ids = Object.keys(recipients).sort();
+  const parts = [
+    field(id.owner),
+    field(a.checkId),
+    field(a.channel),
+    field(destHash),
+    field(String(ids.length)),
+  ];
+  for (const hid of ids) {
+    parts.push(field(hid));
+    parts.push(field(recipients[hid]));
+  }
+  parts.push(field(String(a.failLocations)));
+  parts.push(field(String(a.forSeconds)));
+  parts.push(field(String(a.expiryMs)));
+  parts.push(field(String(a.updatedMs)));
+  parts.push(field(a.deleted ? "1" : "0"));
+  const canonical = "libreping-alert-v4\n" + parts.join("");
   const { pubkey, signature } = signCanonical(id, canonical);
   return {
     rule: {

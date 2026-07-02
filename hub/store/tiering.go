@@ -27,6 +27,32 @@ func DefaultTierConfig() TierConfig {
 	return TierConfig{CompressAfterDays: 2, RawRetentionDays: 7, HourlyRetentionDays: 90, DailyRetentionDays: 730}
 }
 
+// SafeClamp raises retention values that would let a tier drop rows before the
+// aggregate that folds them up has materialized, and returns a human-readable
+// warning for each adjustment so the operator learns history would otherwise be
+// lost. A tier set to 0 ("keep forever") never drops rows, so it is left alone.
+//
+// Raw retention must outlast the hourly rollup's materialization window, and
+// hourly retention the daily window (the daily rollup reads FROM hourly). Below
+// those minimums the lower tier is dropped before the fold-up runs, leaving
+// permanent gaps in the higher tier.
+func (c TierConfig) SafeClamp() (TierConfig, []string) {
+	var warnings []string
+	if c.RawRetentionDays > 0 && c.RawRetentionDays < hourlyMaterializeWindowDays {
+		warnings = append(warnings, fmt.Sprintf(
+			"RawRetentionDays=%d is below the hourly rollup window (%dd); raising to %d so hourly summaries aren't lost",
+			c.RawRetentionDays, hourlyMaterializeWindowDays, hourlyMaterializeWindowDays))
+		c.RawRetentionDays = hourlyMaterializeWindowDays
+	}
+	if c.HourlyRetentionDays > 0 && c.HourlyRetentionDays < dailyMaterializeWindowDays {
+		warnings = append(warnings, fmt.Sprintf(
+			"HourlyRetentionDays=%d is below the daily rollup window (%dd); raising to %d so daily summaries aren't lost",
+			c.HourlyRetentionDays, dailyMaterializeWindowDays, dailyMaterializeWindowDays))
+		c.HourlyRetentionDays = dailyMaterializeWindowDays
+	}
+	return c, warnings
+}
+
 // hourlyCompressAfterDays compresses hourly-rollup chunks older than this. Fixed
 // (not env-tunable) to keep configuration small; hourly rows are already tiny.
 const hourlyCompressAfterDays = 7
@@ -35,6 +61,17 @@ const hourlyCompressAfterDays = 7
 // tier's retention is "keep forever" (0), so the catch-up can't scan unbounded
 // history on a long-lived hub.
 const maxTierRefreshDays = 30
+
+// Continuous-aggregate materialization windows (the policies' start_offset). A
+// lower tier's retention must exceed the window of the aggregate that folds it
+// up, or rows are dropped before they are summarized and the higher tier gets
+// permanent gaps. SafeClamp enforces raw >= hourlyMaterializeWindowDays and
+// hourly >= dailyMaterializeWindowDays. Keep these in sync with the ms() values
+// passed to add_continuous_aggregate_policy in tierStatements.
+const (
+	hourlyMaterializeWindowDays = 3  // start_offset of the hourly rollup policy
+	dailyMaterializeWindowDays  = 10 // start_offset of the daily rollup policy
+)
 
 // refreshLookbackDays is how far back to manually refresh an aggregate so no raw
 // row is dropped by retention before it is summarized: one day past the lower
@@ -200,10 +237,10 @@ func tierStatements(cfg TierConfig) []string {
 		// Keep the rollups materialized. start_offset must comfortably exceed the
 		// next tier's retention so nothing is lost in the fold-up.
 		`SELECT add_continuous_aggregate_policy('results_hourly',
-		   start_offset => ` + ms(3) + `, end_offset => 3600000::BIGINT,
+		   start_offset => ` + ms(hourlyMaterializeWindowDays) + `, end_offset => 3600000::BIGINT,
 		   schedule_interval => INTERVAL '30 minutes', if_not_exists => true)`,
 		`SELECT add_continuous_aggregate_policy('results_daily',
-		   start_offset => ` + ms(10) + `, end_offset => 86400000::BIGINT,
+		   start_offset => ` + ms(dailyMaterializeWindowDays) + `, end_offset => 86400000::BIGINT,
 		   schedule_interval => INTERVAL '6 hours', if_not_exists => true)`,
 	}
 

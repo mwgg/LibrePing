@@ -19,6 +19,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -78,6 +79,37 @@ const (
 	controlSyncProtocol = "/libreping/controlsync/1.0.0"
 	// controlSyncMax bounds each list in a control-sync response.
 	controlSyncMax = 20000
+)
+
+// Read bounds on peer streams. syncMaxResults/controlSyncMax only cap what an
+// HONEST server sends (via capSlice / the fetch limit) — they do nothing to stop
+// a malicious peer from streaming gigabytes of JSON into a client's Decode and
+// OOMing the hub. So every read from a libp2p stream is wrapped in an
+// io.LimitReader sized to the legitimate maximum plus headroom; a payload past
+// the cap makes Decode fail with an unexpected-EOF error, which is exactly the
+// desired "too big -> drop" behavior. The mirror to this is hub/remote, which
+// caps its HTTP holder responses the same way.
+const (
+	// syncReqMaxBytes bounds an inbound sync request: syncRequest is two ints,
+	// a couple hundred bytes marshaled — 4 KiB is generous headroom.
+	syncReqMaxBytes = 4 << 10
+	// resultMaxBytes is a generous per-result byte budget. A SignedResult is
+	// realistically well under 2 KiB (small content + a base64 32-byte pubkey and
+	// 64-byte signature); even a traceroute's detail map is bounded to ~30 hops.
+	// 8 KiB leaves ample room without inviting abuse.
+	resultMaxBytes = 8 << 10
+	// syncRespMaxBytes bounds a sync response: at most syncMaxResults results plus
+	// JSON array framing (brackets/commas). 5000 * 8 KiB ~= 40 MiB, plus slack.
+	syncRespMaxBytes = int64(syncMaxResults)*resultMaxBytes + (64 << 10)
+	// controlEntryMaxBytes is a generous per-entry budget shared by catalog
+	// entries, subscriptions, and alert rules. Each is a small signed struct; the
+	// largest is an alert rule whose sealed-recipient map holds a handful of
+	// top-K hub boxes, still a few KiB. 4 KiB covers all three with headroom.
+	controlEntryMaxBytes = 4 << 10
+	// controlSyncRespMaxBytes bounds a control-sync response: up to controlSyncMax
+	// entries in EACH of the three lists (catalog, subs, alerts). 3 * 20000 * 4 KiB
+	// ~= 240 MiB, plus JSON framing slack. Finite where the read was unbounded.
+	controlSyncRespMaxBytes = 3*int64(controlSyncMax)*controlEntryMaxBytes + (64 << 10)
 )
 
 // syncRequest asks a peer for results at or after SinceMS (capped to Limit).
@@ -256,6 +288,16 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		_ = h.Close()
 		return nil, err
 	}
+	// Gate relay, not just ingest: register a topic validator so gossipsub
+	// verifies every message BEFORE forwarding it to mesh peers. Without this an
+	// honest hub would faithfully re-propagate a garbage/invalid-signature
+	// envelope network-wide (spam amplification) and never penalize the sender —
+	// the readLoop's own verify only gates what this hub stores, not what it
+	// relays. Reject (not Ignore) so gossipsub drops AND peer-scores the sender.
+	if err := ps.RegisterTopicValidator(controlTopic, envelopeValidator(cfg.Policy)); err != nil {
+		_ = h.Close()
+		return nil, err
+	}
 	control, err := ps.Join(controlTopic)
 	if err != nil {
 		_ = h.Close()
@@ -356,8 +398,17 @@ func (n *Node) topicForShardLocked(s uint32) (*pubsub.Topic, error) {
 	if t, ok := n.joined[s]; ok {
 		return t, nil
 	}
-	t, err := n.ps.Join(resultShardName(s))
+	name := resultShardName(s)
+	// Register the relay gate before joining so results are signature+policy
+	// verified before this hub forwards them on the shard's mesh, matching the
+	// control topic. Validators are keyed by topic string, so per-shard topics —
+	// including those joined later via UpdateShards — each get their own.
+	if err := n.ps.RegisterTopicValidator(name, envelopeValidator(n.policy)); err != nil {
+		return nil, err
+	}
+	t, err := n.ps.Join(name)
 	if err != nil {
+		_ = n.ps.UnregisterTopicValidator(name)
 		return nil, err
 	}
 	n.joined[s] = t
@@ -435,7 +486,10 @@ func (n *Node) handleSyncStream(s network.Stream) {
 	_ = s.SetDeadline(time.Now().Add(30 * time.Second))
 
 	var req syncRequest
-	if err := json.NewDecoder(s).Decode(&req); err != nil {
+	// Bound the request read: a peer must not be able to stream unbounded JSON
+	// into this decode (the request is tiny, so anything past syncReqMaxBytes is
+	// abuse and errors out at the cap).
+	if err := json.NewDecoder(io.LimitReader(s, syncReqMaxBytes)).Decode(&req); err != nil {
 		return
 	}
 	if n.resultsSince == nil {
@@ -475,8 +529,18 @@ func (n *Node) syncFrom(ctx context.Context, p peer.ID) {
 		return
 	}
 	var results []protocol.SignedResult
-	if err := json.NewDecoder(s).Decode(&results); err != nil {
+	// Bound the response read: the server agrees to send at most syncMaxResults,
+	// but a malicious peer ignores that, so cap the bytes we'll accept (a payload
+	// past syncRespMaxBytes fails Decode at the cap — the desired "too big -> drop").
+	if err := json.NewDecoder(io.LimitReader(s, syncRespMaxBytes)).Decode(&results); err != nil {
 		n.log.Debug("sync: decode response", "peer", p, "err", err)
+		return
+	}
+	// Enforce the element-count cap the byte budget is sized around, so a peer
+	// that packs many tiny results within the byte cap still can't hand us more
+	// than the agreed maximum. Reject the whole response rather than truncating.
+	if len(results) > syncMaxResults {
+		n.log.Warn("sync: response exceeds max results, dropping", "peer", p, "count", len(results), "max", syncMaxResults)
 		return
 	}
 	for _, sr := range results {
@@ -531,8 +595,18 @@ func (n *Node) controlSyncFrom(ctx context.Context, p peer.ID) {
 	_ = s.SetDeadline(time.Now().Add(30 * time.Second))
 
 	var resp controlSyncResponse
-	if err := json.NewDecoder(s).Decode(&resp); err != nil {
+	// Bound the response read the same way as the result sync: an honest server
+	// caps each list at controlSyncMax, but a malicious peer won't, so limit the
+	// bytes we'll buffer (past controlSyncRespMaxBytes, Decode fails at the cap).
+	if err := json.NewDecoder(io.LimitReader(s, controlSyncRespMaxBytes)).Decode(&resp); err != nil {
 		n.log.Debug("control-sync: decode response", "peer", p, "err", err)
+		return
+	}
+	// Enforce the per-list element cap the byte budget is sized around, so a peer
+	// can't hand us more than the agreed maximum even within the byte budget.
+	if len(resp.Catalog) > controlSyncMax || len(resp.Subscriptions) > controlSyncMax || len(resp.Alerts) > controlSyncMax {
+		n.log.Warn("control-sync: response exceeds max entries, dropping", "peer", p,
+			"catalog", len(resp.Catalog), "subs", len(resp.Subscriptions), "alerts", len(resp.Alerts), "max", controlSyncMax)
 		return
 	}
 	for _, sc := range resp.Catalog {
@@ -762,11 +836,13 @@ func (n *Node) Close() error {
 	}
 	for s, t := range n.joined {
 		_ = t.Close()
+		_ = n.ps.UnregisterTopicValidator(resultShardName(s))
 		delete(n.joined, s)
 	}
 	n.smu.Unlock()
 	n.controlSub.Cancel()
 	_ = n.control.Close()
+	_ = n.ps.UnregisterTopicValidator(controlTopic)
 	_ = n.dht.Close()
 	return n.host.Close()
 }
@@ -830,6 +906,64 @@ func (n *Node) shardReadLoop(ctx context.Context, sub *pubsub.Subscription) {
 			n.handleResult(ctx, *env.Result)
 		}
 	}
+}
+
+// envelopeValidator adapts validateEnvelope to gossipsub's validator signature,
+// binding the trust policy used to gate results. gossipsub runs it in its
+// validation pipeline (a worker pool) before forwarding a message, so it must be
+// self-contained and reentrant: it only reads msg.Data and verifies signatures,
+// never mutating shared state.
+func envelopeValidator(policy trust.Policy) func(context.Context, peer.ID, *pubsub.Message) pubsub.ValidationResult {
+	return func(_ context.Context, _ peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
+		return validateEnvelope(policy, msg.Data)
+	}
+}
+
+// validateEnvelope is the relay gate: it runs the SAME per-kind signature Verify
+// the readLoop dispatch does (and, for results, the same trust policy) so an
+// envelope this hub would reject on ingest is never re-gossiped to peers either.
+// It returns ValidationReject for a message that fails to parse, carries no/bad
+// signature, or (for results) is denied by policy — Reject drops the message AND
+// penalizes the sender via peer scoring. An unrecognized kind is not provably
+// malicious (it may be a forward-compatible extension), so it is Ignored — dropped
+// without penalizing the sender.
+func validateEnvelope(policy trust.Policy, data []byte) pubsub.ValidationResult {
+	var env protocol.GossipEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return pubsub.ValidationReject
+	}
+	switch env.Kind {
+	case protocol.GossipResult:
+		if env.Result == nil || env.Result.Verify() != nil {
+			return pubsub.ValidationReject
+		}
+		if !policy.Allow(env.Result.Content.ProbeID) {
+			return pubsub.ValidationReject
+		}
+	case protocol.GossipCatalog:
+		if env.Catalog == nil || env.Catalog.Verify() != nil {
+			return pubsub.ValidationReject
+		}
+	case protocol.GossipHub:
+		if env.Hub == nil || env.Hub.Verify() != nil {
+			return pubsub.ValidationReject
+		}
+	case protocol.GossipSubscription:
+		if env.Subscription == nil || env.Subscription.Verify() != nil {
+			return pubsub.ValidationReject
+		}
+	case protocol.GossipAlert:
+		if env.Alert == nil || env.Alert.Verify() != nil {
+			return pubsub.ValidationReject
+		}
+	case protocol.GossipDelivery:
+		if env.Delivery == nil || env.Delivery.Verify() != nil {
+			return pubsub.ValidationReject
+		}
+	default:
+		return pubsub.ValidationIgnore
+	}
+	return pubsub.ValidationAccept
 }
 
 // handleResult is the trust gate: verify the signature, then apply policy,

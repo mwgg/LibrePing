@@ -22,14 +22,22 @@ func NewPgAlerts(s *PgStore) *PgAlerts { return &PgAlerts{pool: s.pool} }
 // resurrect a deleted alert.
 func (p *PgAlerts) Upsert(ctx context.Context, sa protocol.SignedAlertRule) error {
 	r := sa.Rule
+	now := nowMS()
+	// Reject a rule stamped implausibly far in the future so it can't lock itself
+	// against later legitimate edits/tombstones (mirrors MemAlerts).
+	if futureUpdatedMS(r.UpdatedMS, now) {
+		return nil
+	}
 	id := r.ID()
 	recipients, err := json.Marshal(r.Recipients)
 	if err != nil {
 		return err
 	}
+	// received_ms is refreshed only when a strictly newer version supersedes, so
+	// a re-gossiped rule can't keep resetting its internal maxOwnerRecordTTL clock.
 	const q = `
-INSERT INTO alerts (rule_id, owner, check_id, channel, dest_hash, recipients, fail_locations, for_seconds, expiry_ms, updated_ms, deleted, pubkey, signature)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+INSERT INTO alerts (rule_id, owner, check_id, channel, dest_hash, recipients, fail_locations, for_seconds, expiry_ms, updated_ms, deleted, pubkey, signature, received_ms)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 ON CONFLICT (rule_id) DO UPDATE SET
   dest_hash = EXCLUDED.dest_hash,
   recipients = EXCLUDED.recipients,
@@ -39,10 +47,11 @@ ON CONFLICT (rule_id) DO UPDATE SET
   updated_ms = EXCLUDED.updated_ms,
   deleted = EXCLUDED.deleted,
   pubkey = EXCLUDED.pubkey,
-  signature = EXCLUDED.signature
+  signature = EXCLUDED.signature,
+  received_ms = EXCLUDED.received_ms
   WHERE EXCLUDED.updated_ms > alerts.updated_ms`
 	if _, err = p.pool.Exec(ctx, q, id, r.Owner, r.CheckID, string(r.Channel), r.DestHash, recipients,
-		r.FailLocations, r.ForSeconds, r.ExpiryMS, r.UpdatedMS, r.Deleted, []byte(sa.PubKey), sa.Signature); err != nil {
+		r.FailLocations, r.ForSeconds, r.ExpiryMS, r.UpdatedMS, r.Deleted, []byte(sa.PubKey), sa.Signature, now); err != nil {
 		return err
 	}
 	if r.Deleted {
@@ -60,13 +69,18 @@ func (p *PgAlerts) ListForGossip(ctx context.Context) ([]protocol.SignedAlertRul
 }
 
 func (p *PgAlerts) listRules(ctx context.Context, includeTombstones bool) ([]protocol.SignedAlertRule, error) {
+	// Live iff the signed expiry hasn't passed AND the internal
+	// received_ms + maxOwnerRecordTTL cap hasn't passed (received_ms = 0 is a
+	// legacy row predating the cap column — no internal cap applies to it).
 	q := `
 SELECT owner, check_id, channel, dest_hash, recipients, fail_locations, for_seconds, expiry_ms, updated_ms, deleted, pubkey, signature
-FROM alerts WHERE (expiry_ms = 0 OR expiry_ms > $1)`
+FROM alerts
+WHERE (expiry_ms = 0 OR expiry_ms > $1)
+  AND (received_ms = 0 OR received_ms + $2 > $1)`
 	if !includeTombstones {
 		q += ` AND deleted = false`
 	}
-	rows, err := p.pool.Query(ctx, q, nowMS())
+	rows, err := p.pool.Query(ctx, q, nowMS(), maxOwnerRecordTTL)
 	if err != nil {
 		return nil, err
 	}

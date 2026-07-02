@@ -2,16 +2,84 @@ package p2p
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mwgg/libreping/hub/trust"
 	"github.com/mwgg/libreping/pkg/identity"
 	"github.com/mwgg/libreping/pkg/protocol"
 )
+
+// TestValidateEnvelope unit-tests the gossipsub relay gate directly: a
+// well-formed signed envelope is Accepted, while a tampered signature, unparseable
+// bytes, a policy-denied result, and a payload/kind mismatch are all handled as
+// the relay path requires — so an invalid envelope is never re-gossiped to peers.
+func TestValidateEnvelope(t *testing.T) {
+	probe, _ := identity.Generate()
+
+	valid, err := protocol.SignResult(probe, protocol.ResultContent{
+		CheckID: "c1", CheckType: protocol.CheckHTTP, Target: "https://example.com",
+		Status: protocol.StatusUp, TimestampMS: 1,
+	})
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	mustEnv := func(env protocol.GossipEnvelope) []byte {
+		b, err := json.Marshal(env)
+		if err != nil {
+			t.Fatalf("marshal envelope: %v", err)
+		}
+		return b
+	}
+
+	validData := mustEnv(protocol.GossipEnvelope{Kind: protocol.GossipResult, Result: &valid})
+	if got := validateEnvelope(trust.Open{}, validData); got != pubsub.ValidationAccept {
+		t.Fatalf("valid result: got %v, want Accept", got)
+	}
+
+	// Tamper after signing: the signature no longer matches -> Reject (drop + penalize).
+	tampered := valid
+	tampered.Content.Status = protocol.StatusDown
+	tamperedData := mustEnv(protocol.GossipEnvelope{Kind: protocol.GossipResult, Result: &tampered})
+	if got := validateEnvelope(trust.Open{}, tamperedData); got != pubsub.ValidationReject {
+		t.Fatalf("tampered result: got %v, want Reject", got)
+	}
+
+	// Unparseable bytes -> Reject.
+	if got := validateEnvelope(trust.Open{}, []byte("{not json")); got != pubsub.ValidationReject {
+		t.Fatalf("garbage: got %v, want Reject", got)
+	}
+
+	// Valid signature but denied by the trust policy -> Reject (must not relay).
+	deny := trust.NewAllowList([]string{"some-other-node"})
+	if got := validateEnvelope(deny, validData); got != pubsub.ValidationReject {
+		t.Fatalf("policy-denied result: got %v, want Reject", got)
+	}
+	// Allowlisting the probe restores Accept.
+	allow := trust.NewAllowList([]string{probe.NodeID()})
+	if got := validateEnvelope(allow, validData); got != pubsub.ValidationAccept {
+		t.Fatalf("allowlisted result: got %v, want Accept", got)
+	}
+
+	// Kind set but its payload pointer is nil -> Reject.
+	nilPayload := mustEnv(protocol.GossipEnvelope{Kind: protocol.GossipResult})
+	if got := validateEnvelope(trust.Open{}, nilPayload); got != pubsub.ValidationReject {
+		t.Fatalf("nil payload: got %v, want Reject", got)
+	}
+
+	// Unrecognized kind (possible forward-compatible extension) -> Ignore, not Reject.
+	unknown := mustEnv(protocol.GossipEnvelope{Kind: protocol.GossipKind("future")})
+	if got := validateEnvelope(trust.Open{}, unknown); got != pubsub.ValidationIgnore {
+		t.Fatalf("unknown kind: got %v, want Ignore", got)
+	}
+}
 
 // TestGossipVerify brings up two in-process hubs, connects them, and asserts
 // that a signed result published by one is verified and ingested by the other —
@@ -348,6 +416,86 @@ func TestControlSyncOnConnect(t *testing.T) {
 		defer mu.Unlock()
 		return gotCatalog >= 1 && gotSubs >= 1
 	}, "node B never control-synced the catalog + subscription from A")
+}
+
+// TestSyncRejectsOversizedResponse proves the client-side bound: a peer that
+// ignores the protocol cap and streams more than syncMaxResults results has its
+// whole response dropped, so none of the over-large payload is ingested. The
+// existing TestResultSyncOnConnect covers the normal-sized happy path, so
+// together they prove the LimitReader/element cap rejects abuse without breaking
+// legitimate sync.
+func TestSyncRejectsOversizedResponse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	probe, _ := identity.Generate()
+
+	// A stand-alone rogue host that speaks the sync protocol but replies with far
+	// more than syncMaxResults valid, signed results — the element cap must reject
+	// the response wholesale even though every individual result verifies.
+	rogueID, _ := identity.Generate()
+	roguePriv, err := crypto.UnmarshalEd25519PrivateKey(rogueID.PrivateKey())
+	if err != nil {
+		t.Fatalf("unmarshal rogue key: %v", err)
+	}
+	rogue, err := libp2p.New(libp2p.Identity(roguePriv), libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("new rogue host: %v", err)
+	}
+	defer rogue.Close()
+
+	over := make([]protocol.SignedResult, 0, syncMaxResults+10)
+	for i := 0; i < syncMaxResults+10; i++ {
+		over = append(over, signResult(t, probe, "c1"))
+	}
+	rogue.SetStreamHandler(syncProtocol, func(s network.Stream) {
+		defer s.Close()
+		var req syncRequest
+		_ = json.NewDecoder(s).Decode(&req) // consume the request, then flood
+		_ = json.NewEncoder(s).Encode(over)
+	})
+
+	var mu sync.Mutex
+	var got int
+	b, err := New(ctx, Config{
+		PrivateKey: idBFor(t), ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"},
+		Ingest: func(_ context.Context, _ protocol.SignedResult) {
+			mu.Lock()
+			got++
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("new B: %v", err)
+	}
+	defer b.Close()
+
+	// B connecting to the rogue triggers its notifee -> syncFrom -> the flood.
+	rogueAddrs, err := peer.AddrInfoToP2pAddrs(&peer.AddrInfo{ID: rogue.ID(), Addrs: rogue.Addrs()})
+	if err != nil || len(rogueAddrs) == 0 {
+		t.Fatalf("rogue addrs: %v", err)
+	}
+	if err := b.Connect(ctx, rogueAddrs[0].String()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	// Give syncFrom ample time to run and (correctly) reject the flood.
+	time.Sleep(2 * time.Second)
+	mu.Lock()
+	defer mu.Unlock()
+	if got != 0 {
+		t.Fatalf("ingested %d results from an over-cap response; want 0 (rejected)", got)
+	}
+}
+
+// idBFor returns a fresh Ed25519 private key for a test node.
+func idBFor(t *testing.T) []byte {
+	t.Helper()
+	id, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	return id.PrivateKey()
 }
 
 func TestFilterDialable(t *testing.T) {

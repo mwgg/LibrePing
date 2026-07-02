@@ -1,9 +1,10 @@
 package checks
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"net"
-	"os"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -14,6 +15,30 @@ import (
 
 // icmpProtocol is the IANA protocol number for ICMPv4, used by icmp.ParseMessage.
 const icmpProtocol = 1
+
+// icmpProbe is the per-run identity used to recognise our own echo replies
+// among all ICMP traffic. On the raw-socket path the kernel delivers every
+// host's ICMP packets to every raw ICMP socket, so a check must not count a
+// reply unless it carries this run's identifier, sequence, and echo token —
+// otherwise concurrent checks (or any other pinging process) inject false
+// replies. A random per-run id and token also prevents two concurrent checks,
+// which would otherwise share a PID-derived id, from counting each other.
+type icmpProbe struct {
+	id    int    // ICMP identifier we set on outgoing echoes (16-bit)
+	token []byte // echo body we send and must see echoed back
+}
+
+// newICMPProbe derives a fresh 16-bit identifier and a "libreping"-prefixed
+// nonce token, so a foreign echo whose body happens to be "libreping" can't be
+// mistaken for ours.
+func newICMPProbe() icmpProbe {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return icmpProbe{
+		id:    int(b[0])<<8 | int(b[1]),
+		token: append([]byte("libreping"), b[2:]...),
+	}
+}
 
 // icmpListen opens an ICMP socket, preferring unprivileged datagram ICMP (works
 // when net.ipv4.ping_group_range allows it) and falling back to a raw socket
@@ -41,15 +66,17 @@ func RawSocketsAvailable() bool {
 }
 
 // pingOnce sends a single ICMP echo with the given TTL and waits for a reply or
-// a time-exceeded (used by traceroute). Returns the responding hop, the RTT,
-// and the ICMP reply type.
-func pingOnce(conn *icmp.PacketConn, privileged bool, dst net.IP, ttl, seq int, timeout time.Duration) (net.IP, time.Duration, ipv4.ICMPType, error) {
+// a time-exceeded (used by traceroute) that matches this run's probe identity.
+// Returns the responding hop, the RTT, and the ICMP reply type. Packets that do
+// not belong to this probe are skipped (the read continues on the same absolute
+// deadline) so a foreign packet can't steal the read or be counted as a reply.
+func pingOnce(conn *icmp.PacketConn, privileged bool, p icmpProbe, dst net.IP, ttl, seq int, timeout time.Duration) (net.IP, time.Duration, ipv4.ICMPType, error) {
 	if err := conn.IPv4PacketConn().SetTTL(ttl); err != nil {
 		return nil, 0, 0, err
 	}
 	msg := icmp.Message{
 		Type: ipv4.ICMPTypeEcho, Code: 0,
-		Body: &icmp.Echo{ID: os.Getpid() & 0xffff, Seq: seq, Data: []byte("libreping")},
+		Body: &icmp.Echo{ID: p.id, Seq: seq, Data: p.token},
 	}
 	wb, err := msg.Marshal(nil)
 	if err != nil {
@@ -77,13 +104,100 @@ func pingOnce(conn *icmp.PacketConn, privileged bool, dst net.IP, ttl, seq int, 
 		if err != nil {
 			continue
 		}
-		switch rm.Type {
-		case ipv4.ICMPTypeEchoReply:
-			return peerIP(peer), time.Since(start), ipv4.ICMPTypeEchoReply, nil
-		case ipv4.ICMPTypeTimeExceeded:
-			return peerIP(peer), time.Since(start), ipv4.ICMPTypeTimeExceeded, nil
+		reply, ok := parseReply(rm, peer)
+		if !ok || !matchReply(reply, privileged, p, seq, dst) {
+			continue
 		}
+		return reply.src, time.Since(start), reply.typ, nil
 	}
+}
+
+// icmpReply is the matcher-relevant view of a received ICMP message. For a
+// TimeExceeded, innerID/innerSeq come from the quoted original echo header;
+// they are -1 when the quotation is too short to parse.
+type icmpReply struct {
+	typ      ipv4.ICMPType
+	src      net.IP
+	id       int    // EchoReply identifier
+	seq      int    // EchoReply sequence
+	body     []byte // EchoReply payload
+	innerID  int    // quoted original echo identifier (TimeExceeded)
+	innerSeq int    // quoted original echo sequence (TimeExceeded)
+}
+
+// parseReply projects a parsed ICMP message into the fields the matcher needs.
+// It returns false for message types we never match on.
+func parseReply(rm *icmp.Message, peer net.Addr) (icmpReply, bool) {
+	typ, ok := rm.Type.(ipv4.ICMPType)
+	if !ok {
+		return icmpReply{}, false
+	}
+	r := icmpReply{typ: typ, src: peerIP(peer), innerID: -1, innerSeq: -1}
+	switch b := rm.Body.(type) {
+	case *icmp.Echo:
+		r.id, r.seq, r.body = b.ID, b.Seq, b.Data
+	case *icmp.TimeExceeded:
+		if id, seq, ok := quotedEcho(b.Data); ok {
+			r.innerID, r.innerSeq = id, seq
+		}
+	default:
+		return r, false
+	}
+	return r, true
+}
+
+// quotedEcho extracts the ICMP identifier and sequence of the original echo
+// quoted inside a TimeExceeded body. The quotation is the original IPv4 header
+// (variable length via IHL) followed by at least the 8-byte ICMP header
+// (type, code, checksum, id, seq).
+func quotedEcho(data []byte) (id, seq int, ok bool) {
+	if len(data) < 20 {
+		return 0, 0, false
+	}
+	ihl := int(data[0]&0x0f) * 4
+	if ihl < 20 || len(data) < ihl+8 {
+		return 0, 0, false
+	}
+	h := data[ihl:]
+	return int(h[4])<<8 | int(h[5]), int(h[6])<<8 | int(h[7]), true
+}
+
+// matchReply reports whether an ICMP message is a reply to the echo this run
+// sent with the given sequence to dst. On the unprivileged datagram path the
+// kernel rewrites the identifier to the socket's port, so the id is trusted
+// only when privileged (a raw socket, where we control it); on that path the
+// socket is already per-flow demuxed, and seq/token/source still hold.
+func matchReply(r icmpReply, privileged bool, p icmpProbe, seq int, dst net.IP) bool {
+	switch r.typ {
+	case ipv4.ICMPTypeEchoReply:
+		if privileged && r.id != p.id {
+			return false
+		}
+		if r.seq != seq {
+			return false
+		}
+		if !bytes.Equal(r.body, p.token) {
+			return false
+		}
+		// An echo reply must originate from the host we pinged.
+		if dst != nil && r.src != nil && !r.src.Equal(dst) {
+			return false
+		}
+		return true
+	case ipv4.ICMPTypeTimeExceeded:
+		// Match the quoted original echo so a foreign time-exceeded (or a
+		// stray echo reply) can't be attributed to our traceroute hop. The
+		// hop's source address is an intermediate router, not dst, so it is
+		// not constrained here.
+		if r.innerSeq != seq {
+			return false
+		}
+		if privileged && r.innerID >= 0 && r.innerID != p.id {
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 func peerIP(addr net.Addr) net.IP {
@@ -125,10 +239,11 @@ func (ICMPChecker) Run(ctx context.Context, spec protocol.CheckSpec) (Outcome, e
 	}
 	defer conn.Close()
 
+	probe := newICMPProbe()
 	var received int
 	var total time.Duration
 	for seq := 0; seq < count; seq++ {
-		_, rtt, typ, err := pingOnce(conn, privileged, ipAddr.IP, 64, seq, timeout)
+		_, rtt, typ, err := pingOnce(conn, privileged, probe, ipAddr.IP, 64, seq, timeout)
 		if err == nil && typ == ipv4.ICMPTypeEchoReply {
 			received++
 			total += rtt

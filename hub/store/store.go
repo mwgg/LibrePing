@@ -100,7 +100,27 @@ func historyResolution(spanMS int64) (label string, bucketMS int64) {
 	return "daily", dayMS
 }
 
+const (
+	// memStoreMaxResults bounds the in-memory result ring. MemStore is the
+	// trial/no-DB path (DATABASE_URL unset) and its results are already
+	// documented as not persisted, so keeping a finite, generous window rather
+	// than every result ever seen is acceptable and honest: a DB-less hub that
+	// runs indefinitely stays bounded instead of growing until OOM. Real
+	// deployments use PgStore, which has retention/tiering and is untouched here.
+	memStoreMaxResults = 200_000
+	// memStoreEvictBatch is how many oldest entries are dropped once the ring is
+	// full, so the O(n) compaction runs once per batch of inserts (amortized
+	// O(1)) instead of on every insert past the cap.
+	memStoreEvictBatch = memStoreMaxResults / 8
+)
+
 // MemStore is an in-memory ResultStore. Safe for concurrent use.
+//
+// It is a finite ring: at most memStoreMaxResults results are retained, oldest
+// (by insertion order) evicted first. Eviction also drops the corresponding
+// dedupe key so memory is actually reclaimed — an evicted result that later
+// re-arrives over gossip is simply re-inserted, which is fine on this
+// non-persistent trial path.
 type MemStore struct {
 	mu   sync.Mutex
 	seen map[string]struct{}
@@ -125,7 +145,30 @@ func (m *MemStore) Insert(_ context.Context, sr protocol.SignedResult) error {
 	}
 	m.seen[key] = struct{}{}
 	m.all = append(m.all, sr)
+	m.evictOverCapLocked()
 	return nil
+}
+
+// evictOverCapLocked drops the oldest entries in a batch once the ring exceeds
+// its cap, reclaiming both the slice element and its dedupe key. Compaction
+// copies the surviving tail to the front and clears the freed slots so the
+// evicted SignedResults are collected rather than pinned by the backing array.
+func (m *MemStore) evictOverCapLocked() {
+	if len(m.all) <= memStoreMaxResults {
+		return
+	}
+	drop := len(m.all) - (memStoreMaxResults - memStoreEvictBatch)
+	if drop > len(m.all) {
+		drop = len(m.all)
+	}
+	for i := 0; i < drop; i++ {
+		delete(m.seen, dedupeKey(m.all[i].Content))
+	}
+	n := copy(m.all, m.all[drop:])
+	for i := n; i < len(m.all); i++ {
+		m.all[i] = protocol.SignedResult{} // release references in the freed tail
+	}
+	m.all = m.all[:n]
 }
 
 func (m *MemStore) Recent(_ context.Context, limit int) ([]protocol.SignedResult, error) {
