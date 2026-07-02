@@ -1,6 +1,6 @@
 // Thin client for the hub JSON API. Reads are public; writes carry an
 // owner-signed payload built in identity.ts.
-import { Identity, signSubscription, signAlertRule, AlertInput, AlertChannel, HubKey } from "./identity";
+import { Identity, signSubscription, signAlertRule, signMaintenanceWindow, AlertInput, AlertChannel, HubKey } from "./identity";
 
 const DEFAULT_EXPIRY_DAYS = 7;
 
@@ -47,6 +47,34 @@ export interface HistorySummary {
   rtt_min: number;
   rtt_max: number;
   last_status: string;
+  check_type: string;
+  target: string;
+  // The probe's self-declared location for the bucket. May be partially empty
+  // (country/city blank) since location is not proven — group the blanks into an
+  // "Unknown" region rather than dropping them.
+  location: { country: string; city: string; lat: number; lon: number };
+}
+
+// UptimeWindow is one time-window's availability estimate (GET /api/v1/uptime).
+// `uptime` is (up+degraded)/samples in [0,1], or null when `available` is false —
+// which happens when this hub has no local data for the check or doesn't hold it.
+export interface UptimeWindow {
+  uptime: number | null;
+  samples: number;
+  up: number;
+  down: number;
+  degraded: number;
+  available: boolean;
+}
+
+// The windows the uptime endpoint reports, in display order.
+export type UptimeWindowKey = "24h" | "7d" | "30d";
+
+// UptimeReport is the per-check availability across the standard windows. It is a
+// sample-weighted estimate (a share of observations up, not wall-clock uptime).
+export interface UptimeReport {
+  check_id: string;
+  windows: Partial<Record<UptimeWindowKey, UptimeWindow>>;
 }
 
 // AlertRule is the hub-side view of a rule (GET /api/v1/alerts). The destination
@@ -60,6 +88,20 @@ export interface AlertRule {
   recipients: Record<string, string>;
   fail_locations: number;
   for_seconds: number;
+  expiry_ms: number;
+  updated_ms: number;
+  deleted?: boolean;
+}
+
+// MaintenanceWindow is the hub-side view of an owner's planned-downtime window
+// (GET /api/v1/maintenance). It is owner-signed and gossiped, not sealed. A
+// window is ACTIVE at time T when !deleted && start_ms <= T < end_ms.
+export interface MaintenanceWindow {
+  owner: string;
+  check_id: string;
+  start_ms: number;
+  end_ms: number;
+  reason?: string;
   expiry_ms: number;
   updated_ms: number;
   deleted?: boolean;
@@ -101,6 +143,109 @@ export async function queryResults(checkId: string, sinceMs?: number, limit = 50
   const res = await fetch(`/api/v1/results/query?${p.toString()}`);
   if (!res.ok) return [];
   return res.json();
+}
+
+// uptime fetches sample-weighted availability estimates (24h/7d/30d) for one
+// check. Like the other read paths it never throws: on error (or a hub that
+// doesn't hold the check) it returns an empty-windows report so callers render
+// "n/a" rather than blowing up the card.
+export async function uptime(checkId: string): Promise<UptimeReport> {
+  try {
+    const res = await fetch(`/api/v1/uptime?check_id=${encodeURIComponent(checkId)}`);
+    if (!res.ok) return { check_id: checkId, windows: {} };
+    return res.json();
+  } catch {
+    return { check_id: checkId, windows: {} };
+  }
+}
+
+// LatencyPercentiles is one time-window's latency distribution (GET
+// /api/v1/latency). p50/p95/p99/min/max are milliseconds or null; `available`
+// is false when this hub doesn't hold the check or has no measured samples (then
+// render "n/a"). `count` is the number of samples that fed the percentiles —
+// note long windows are raw-limited (on Postgres the raw window is ~7d), so a
+// 30d request's `count` reflects actual coverage, not a full 30 days.
+export interface LatencyPercentiles {
+  check_id: string;
+  window: UptimeWindowKey;
+  p50: number | null;
+  p95: number | null;
+  p99: number | null;
+  min: number | null;
+  max: number | null;
+  count: number;
+  available: boolean;
+}
+
+// latency fetches the latency percentile distribution for one check over one
+// window. Like the other read paths it never throws: on error (or a hub that
+// doesn't hold the check) it returns an unavailable shape so callers render
+// "n/a" rather than blowing up the panel.
+export async function latency(checkId: string, window: UptimeWindowKey = "24h"): Promise<LatencyPercentiles> {
+  const unavailable = (): LatencyPercentiles => ({
+    check_id: checkId,
+    window,
+    p50: null,
+    p95: null,
+    p99: null,
+    min: null,
+    max: null,
+    count: 0,
+    available: false,
+  });
+  try {
+    const p = new URLSearchParams({ check_id: checkId, window });
+    const res = await fetch(`/api/v1/latency?${p.toString()}`);
+    if (!res.ok) return unavailable();
+    return res.json();
+  } catch {
+    return unavailable();
+  }
+}
+
+// IncidentWindowKey is the lookback the incident endpoint accepts.
+export type IncidentWindowKey = "24h" | "7d" | "30d";
+
+// Incident is one past outage window (GET /api/v1/incidents). Times are
+// bucket-aligned to the report's `resolution` (hourly ≤14d, daily beyond), so
+// `duration_ms` reflects covered buckets, not wall-clock to the second.
+// `worst_status` is the most severe status seen across the incident's buckets.
+// `ongoing` means the outage is still open (end_ms is "now").
+export interface Incident {
+  start_ms: number;
+  end_ms: number;
+  duration_ms: number;
+  worst_status: string;
+  bucket_count: number;
+  resolution: string;
+  ongoing: boolean;
+}
+
+// IncidentReport is the list of past outages for one check over a window,
+// newest-first. `incidents` is empty when the check was all-up, had no data, or
+// isn't held by this hub. `resolution` captions the bucket granularity.
+export interface IncidentReport {
+  check_id: string;
+  window: IncidentWindowKey;
+  resolution: string;
+  incidents: Incident[];
+}
+
+// incidents fetches the outage timeline for one check. Like the other read
+// paths it never throws: on error (or a hub that doesn't hold the check) it
+// returns an empty-incidents report so callers render the empty state rather
+// than blowing up the panel.
+export async function incidents(checkId: string, window: IncidentWindowKey = "30d"): Promise<IncidentReport> {
+  const empty = (): IncidentReport => ({ check_id: checkId, window, resolution: "", incidents: [] });
+  try {
+    const p = new URLSearchParams({ check_id: checkId, window });
+    const res = await fetch(`/api/v1/incidents?${p.toString()}`);
+    if (!res.ok) return empty();
+    const v = await res.json();
+    return { ...v, incidents: Array.isArray(v.incidents) ? v.incidents : [] };
+  } catch {
+    return empty();
+  }
 }
 
 // listAlerts returns the owner's alert rules as the hub sees them (no plaintext
@@ -201,6 +346,54 @@ export function forgetStoredAlerts(checkId: string) {
   localStorage.setItem(ALERTS_KEY, JSON.stringify(all));
 }
 
+// --- Local SLO targets (browser-only) ---
+//
+// A per-check SLO target is a user preference, not network state: it is never
+// signed, gossiped, or sent to a hub. It lives only in this browser's
+// localStorage (same model as the account seed and the stored alerts), so
+// targets are per-device, not shared across a user's browsers. The error budget
+// is derived at render time from the public /api/v1/uptime numbers, so there is
+// nothing to persist beyond the target fraction itself.
+const SLO_KEY = "libreping_slo";
+
+// Targets are availability fractions strictly inside (0,1), e.g. 0.999 for
+// three-nines. Stored as a { [checkId]: targetFraction } map.
+type SLOMap = Record<string, number>;
+
+function loadSLOMap(): SLOMap {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SLO_KEY) || "{}");
+    if (!raw || typeof raw !== "object") return {};
+    const out: SLOMap = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === "number" && v > 0 && v < 1) out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// getSLOTarget returns the saved target fraction for a check, or null if none is
+// set (or the stored value is out of the (0,1) range).
+export function getSLOTarget(checkId: string): number | null {
+  const v = loadSLOMap()[checkId];
+  return typeof v === "number" ? v : null;
+}
+
+// setSLOTarget saves (or, when passed null, clears) a check's target. A target
+// outside (0,1) is treated as clearing it — 100% leaves no budget and 0% is
+// meaningless.
+export function setSLOTarget(checkId: string, target: number | null): void {
+  const map = loadSLOMap();
+  if (target === null || !(target > 0 && target < 1)) {
+    delete map[checkId];
+  } else {
+    map[checkId] = target;
+  }
+  localStorage.setItem(SLO_KEY, JSON.stringify(map));
+}
+
 // deleteAlert removes one alert: it gossips a signed tombstone (deleted rule,
 // recipients omitted — see identity.signAlertRule) so the network forgets it,
 // then drops the local copy. Mirrors the unsubscribe tombstone pattern.
@@ -210,6 +403,60 @@ export async function deleteAlert(id: Identity, a: StoredAlert): Promise<void> {
   await postSigned("/api/v1/alerts", payload);
   const all = loadStoredAlerts().filter((x) => alertKey(x) !== alertKey(a));
   localStorage.setItem(ALERTS_KEY, JSON.stringify(all));
+}
+
+// --- Maintenance windows (owner-signed, gossiped) ---
+
+// The bound placed on a window's ExpiryMS past its end, so hubs retain the
+// record (and its tombstone) through the window and a grace period, then prune.
+const MAINTENANCE_SLACK_MS = 7 * 24 * 60 * 60 * 1000;
+
+// listMaintenance returns the owner's (and/or a check's) active maintenance
+// windows as the hub sees them. Deleted/expired windows are not returned. Never
+// throws: on error it resolves to an empty list.
+export async function listMaintenance(filter: { checkId?: string; owner?: string }): Promise<MaintenanceWindow[]> {
+  const p = new URLSearchParams();
+  if (filter.checkId) p.set("check_id", filter.checkId);
+  if (filter.owner) p.set("owner", filter.owner);
+  try {
+    const res = await fetch(`/api/v1/maintenance?${p.toString()}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+// scheduleMaintenance signs and posts a planned-downtime window for a check. The
+// expiry is bounded to the window's end plus a grace slack so abandoned windows
+// fall out of the network. Mirrors the subscribe pattern.
+export async function scheduleMaintenance(id: Identity, input: { checkId: string; startMs: number; endMs: number; reason?: string }): Promise<void> {
+  const payload = signMaintenanceWindow(id, {
+    checkId: input.checkId,
+    startMs: input.startMs,
+    endMs: input.endMs,
+    reason: input.reason,
+    expiryMs: input.endMs + MAINTENANCE_SLACK_MS,
+    updatedMs: Date.now(),
+  });
+  await postSigned("/api/v1/maintenance", payload);
+}
+
+// deleteMaintenance sends a signed tombstone (deleted window) with a fresh
+// updatedMs so it wins over the earlier record, and a bounded expiry so hubs
+// retain the tombstone to reject replays, then prune it. Mirrors unsubscribe.
+export async function deleteMaintenance(id: Identity, w: MaintenanceWindow): Promise<void> {
+  const payload = signMaintenanceWindow(id, {
+    checkId: w.check_id,
+    startMs: w.start_ms,
+    endMs: w.end_ms,
+    reason: w.reason,
+    expiryMs: expiryMs(),
+    updatedMs: Date.now(),
+    deleted: true,
+  });
+  await postSigned("/api/v1/maintenance", payload);
 }
 
 // renewLeases re-signs the owner's current subscriptions and stored alerts with

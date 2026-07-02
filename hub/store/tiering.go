@@ -48,6 +48,20 @@ func refreshLookbackDays(retentionDays int) int {
 
 const dayMS = int64(86_400_000)
 
+// Latency percentiles over longer-than-raw windows would live here as a tdigest /
+// approx_percentile column on the results_hourly (and hierarchically
+// results_daily) continuous aggregates, exposed for windows that exceed raw
+// retention. That is DEFERRED: approx_percentile/tdigest come from the
+// timescaledb_toolkit extension, which the pinned plain TimescaleDB image
+// (timescale/timescaledb:2.17.2-pg16, see docker-compose*.yml) does NOT bundle —
+// the toolkit ships only in the timescaledb-ha images. Adding an aggregate that
+// depends on a missing extension would break ConfigureResultTiers (and thus hub
+// startup) on the images this project actually runs. The shipped percentile
+// endpoint (GET /api/v1/latency, hub/store/latency.go) is computed from RAW
+// results instead, so it works on every hub within raw retention. Revisit when the
+// image gains the toolkit: feature-detect via pg_available_extensions and add the
+// column behind that guard, degrading gracefully (logged warning) when absent.
+
 // ConfigureResultTiers sets up compression + downsampling on the results
 // hypertable: native columnar compression, two hierarchical continuous
 // aggregates (hourly→daily), and retention policies per tier. It is idempotent

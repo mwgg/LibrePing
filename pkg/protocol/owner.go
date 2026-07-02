@@ -90,6 +90,91 @@ func (ss SignedSubscription) Verify() error {
 	return verifyOwner(ss.PubKey, ss.Subscription.Owner, ss.Subscription.canonical(), ss.Signature)
 }
 
+// MaintenanceWindow is an owner-signed, planned-downtime window for a check.
+// While a window is active, alerts for the check are suppressed and the window
+// is excluded from the check's uptime percentage. Because any hub may be the one
+// responsible for a rule and every hub computes uptime, a window must be known
+// network-wide — so it is gossiped and tombstoned exactly like a Subscription
+// (owner-signed, versioned by UpdatedMS, expiring), NOT sealed to any hub.
+//
+// A window is ACTIVE at time T when !Deleted && StartMS <= T < EndMS.
+//
+// Unlike Subscription/AlertRule (which newline-join their canonical fields),
+// MaintenanceWindow uses a LENGTH-PREFIXED canonical encoding (each field as
+// "<byteLen>:<bytes>", the same hardening CheckSpec.DeriveID uses): a field
+// value that contains the "\n" separator cannot be crafted to shift the field
+// boundaries and forge a different-but-identically-signing window. This is the
+// project's convention for new owner-signed types. Version: libreping-maintenance-v1.
+type MaintenanceWindow struct {
+	Owner    string `json:"owner"`
+	CheckID  string `json:"check_id"`
+	StartMS  int64  `json:"start_ms"`
+	EndMS    int64  `json:"end_ms"`
+	Reason   string `json:"reason,omitempty"`
+	ExpiryMS int64  `json:"expiry_ms"`
+	// UpdatedMS is a signed, monotonic version stamp; a store rejects an incoming
+	// window older than the one it holds, so an old signed record cannot be
+	// replayed to undo a later delete or edit. See Subscription.UpdatedMS.
+	UpdatedMS int64 `json:"updated_ms"`
+	Deleted   bool  `json:"deleted,omitempty"` // signed tombstone
+}
+
+// MaxMaintenanceReasonLen bounds the free-text reason so a signed window can't
+// carry an unbounded blob through gossip.
+const MaxMaintenanceReasonLen = 280
+
+// ID is the storage/dedup key for a window: one per owner+check+start. Editing
+// End/Reason keeps the same ID; a different start is a distinct window.
+func (m MaintenanceWindow) ID() string {
+	sum := sha256.Sum256([]byte(m.Owner + "|" + m.CheckID + "|" + strconv.FormatInt(m.StartMS, 10)))
+	return hex.EncodeToString(sum[:8])
+}
+
+// Active reports whether the window is in effect at time t (millis).
+func (m MaintenanceWindow) Active(t int64) bool {
+	return !m.Deleted && m.StartMS <= t && t < m.EndMS
+}
+
+// canonical renders the length-prefixed signing payload (see the type doc). The
+// domain tag is length-prefixed too, so nothing — not even the version — can be
+// shifted across a field boundary. The JS client mirrors this byte-for-byte.
+func (m MaintenanceWindow) canonical() []byte {
+	var b strings.Builder
+	writeField := func(v string) {
+		b.WriteString(strconv.Itoa(len(v)))
+		b.WriteByte(':')
+		b.WriteString(v)
+	}
+	writeField("libreping-maintenance-v1")
+	writeField(m.Owner)
+	writeField(m.CheckID)
+	writeField(strconv.FormatInt(m.StartMS, 10))
+	writeField(strconv.FormatInt(m.EndMS, 10))
+	writeField(m.Reason)
+	writeField(strconv.FormatInt(m.ExpiryMS, 10))
+	writeField(strconv.FormatInt(m.UpdatedMS, 10))
+	writeField(boolField(m.Deleted))
+	return []byte(b.String())
+}
+
+// SignedMaintenanceWindow is a MaintenanceWindow plus the owner's key/signature.
+type SignedMaintenanceWindow struct {
+	Window    MaintenanceWindow `json:"window"`
+	PubKey    ed25519.PublicKey `json:"pubkey"`
+	Signature []byte            `json:"signature"`
+}
+
+// SignMaintenanceWindow stamps the owner ID and signs (the browser signs with
+// the identical canonical form).
+func SignMaintenanceWindow(id *identity.Identity, m MaintenanceWindow) SignedMaintenanceWindow {
+	m.Owner = id.NodeID()
+	return SignedMaintenanceWindow{Window: m, PubKey: id.Public(), Signature: id.Sign(m.canonical())}
+}
+
+func (sm SignedMaintenanceWindow) Verify() error {
+	return verifyOwner(sm.PubKey, sm.Window.Owner, sm.Window.canonical(), sm.Signature)
+}
+
 // AlertChannel is how an alert is delivered. Every channel is a plain outbound
 // HTTPS request to an owner-supplied destination, so none needs any hub-operator
 // configuration (unlike the old SMTP email channel, which is gone).

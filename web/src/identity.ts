@@ -154,6 +154,63 @@ export function signSubscription(id: Identity, s: SubscriptionInput) {
   };
 }
 
+// lenPrefix builds the length-prefixed signing payload used by the hardened
+// owner-signed types (currently MaintenanceWindow). Each field is written as
+// `<byteLength>:<bytes>` with NO separators, concatenated. The length is the
+// UTF-8 BYTE length, matching Go's `len(v)` over a string. This mirrors
+// protocol.MaintenanceWindow.canonical byte-for-byte, so nothing — not even the
+// version tag — can be shifted across a field boundary.
+function lenPrefix(fields: string[]): string {
+  const enc = new TextEncoder();
+  let out = "";
+  for (const f of fields) out += enc.encode(f).length + ":" + f;
+  return out;
+}
+
+export interface MaintenanceInput {
+  checkId: string;
+  startMs: number;
+  endMs: number;
+  reason?: string;
+  expiryMs: number;
+  updatedMs: number;
+  deleted?: boolean;
+}
+
+// signMaintenanceWindow builds the wire SignedMaintenanceWindow the hub verifies.
+// The canonical form is LENGTH-PREFIXED (see lenPrefix) — NOT newline-joined like
+// Subscription/AlertRule — and MUST byte-match Go's MaintenanceWindow.canonical
+// (owner.go, version libreping-maintenance-v1). A signed window with deleted=true
+// is the tombstone that removes it; carry a fresh, larger updatedMs so it wins.
+export function signMaintenanceWindow(id: Identity, m: MaintenanceInput) {
+  const canonical = lenPrefix([
+    "libreping-maintenance-v1",
+    id.owner,
+    m.checkId,
+    String(m.startMs),
+    String(m.endMs),
+    m.reason ?? "",
+    String(m.expiryMs),
+    String(m.updatedMs),
+    m.deleted ? "1" : "0",
+  ]);
+  const { pubkey, signature } = signCanonical(id, canonical);
+  return {
+    window: {
+      owner: id.owner,
+      check_id: m.checkId,
+      start_ms: m.startMs,
+      end_ms: m.endMs,
+      ...(m.reason ? { reason: m.reason } : {}),
+      expiry_ms: m.expiryMs,
+      updated_ms: m.updatedMs,
+      ...(m.deleted ? { deleted: true } : {}),
+    },
+    pubkey,
+    signature,
+  };
+}
+
 // AlertChannel mirrors protocol.AlertChannel — every channel is a plain HTTPS
 // POST to an owner-supplied destination (no hub config). `channel` is signed as a
 // plain string in the canonical form, so this set can grow without a version bump.

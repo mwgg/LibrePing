@@ -90,9 +90,10 @@ type syncRequest struct {
 // connect. Each item is independently signature-verified on ingest, so the
 // relaying peer is never trusted — only the original signer.
 type controlSyncResponse struct {
-	Catalog       []protocol.SignedCatalogEntry `json:"catalog,omitempty"`
-	Subscriptions []protocol.SignedSubscription `json:"subscriptions,omitempty"`
-	Alerts        []protocol.SignedAlertRule    `json:"alerts,omitempty"`
+	Catalog       []protocol.SignedCatalogEntry      `json:"catalog,omitempty"`
+	Subscriptions []protocol.SignedSubscription      `json:"subscriptions,omitempty"`
+	Alerts        []protocol.SignedAlertRule         `json:"alerts,omitempty"`
+	Maintenance   []protocol.SignedMaintenanceWindow `json:"maintenance,omitempty"`
 }
 
 // resultShardName is the gossipsub topic for a result shard.
@@ -117,6 +118,9 @@ type IngestAlertFunc func(ctx context.Context, sa protocol.SignedAlertRule)
 
 // IngestDeliveryFunc handles a verified delivery-state from the mesh.
 type IngestDeliveryFunc func(ctx context.Context, sd protocol.SignedDeliveryState)
+
+// IngestMaintenanceFunc handles a verified maintenance window from the mesh.
+type IngestMaintenanceFunc func(ctx context.Context, sm protocol.SignedMaintenanceWindow)
 
 // Config configures a Node.
 type Config struct {
@@ -147,6 +151,7 @@ type Config struct {
 	CatalogSnapshot      func(ctx context.Context) ([]protocol.SignedCatalogEntry, error)
 	SubscriptionSnapshot func(ctx context.Context) ([]protocol.SignedSubscription, error)
 	AlertSnapshot        func(ctx context.Context) ([]protocol.SignedAlertRule, error)
+	MaintenanceSnapshot  func(ctx context.Context) ([]protocol.SignedMaintenanceWindow, error)
 	// Ingest is called for each verified+trusted result from peers.
 	Ingest IngestFunc
 	// IngestCatalog is called for each verified catalog entry from peers.
@@ -159,6 +164,8 @@ type Config struct {
 	IngestAlert IngestAlertFunc
 	// IngestDelivery is called for each verified delivery-state from peers.
 	IngestDelivery IngestDeliveryFunc
+	// IngestMaintenance is called for each verified maintenance window from peers.
+	IngestMaintenance IngestMaintenanceFunc
 	// Policy decides which result signers are admitted; defaults to trust.Open.
 	Policy trust.Policy
 	Logger *slog.Logger
@@ -177,10 +184,12 @@ type Node struct {
 	ingestSubscription IngestSubscriptionFunc
 	ingestAlert        IngestAlertFunc
 	ingestDelivery     IngestDeliveryFunc
+	ingestMaintenance  IngestMaintenanceFunc
 	resultsSince       func(ctx context.Context, sinceMS int64, limit int) ([]protocol.SignedResult, error)
 	catalogSnapshot    func(ctx context.Context) ([]protocol.SignedCatalogEntry, error)
 	subSnapshot        func(ctx context.Context) ([]protocol.SignedSubscription, error)
 	alertSnapshot      func(ctx context.Context) ([]protocol.SignedAlertRule, error)
+	maintSnapshot      func(ctx context.Context) ([]protocol.SignedMaintenanceWindow, error)
 	policy             trust.Policy
 	log                *slog.Logger
 	mdnsSvc            mdns.Service
@@ -276,10 +285,11 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		host: h, dht: kad, ps: ps, control: control, controlSub: controlSub,
 		ingest: cfg.Ingest, ingestCatalog: cfg.IngestCatalog, ingestHub: cfg.IngestHub,
 		ingestSubscription: cfg.IngestSubscription, ingestAlert: cfg.IngestAlert,
-		ingestDelivery: cfg.IngestDelivery, resultsSince: cfg.ResultsSince,
+		ingestDelivery: cfg.IngestDelivery, ingestMaintenance: cfg.IngestMaintenance,
+		resultsSince:    cfg.ResultsSince,
 		catalogSnapshot: cfg.CatalogSnapshot, subSnapshot: cfg.SubscriptionSnapshot,
-		alertSnapshot: cfg.AlertSnapshot,
-		policy:        cfg.Policy, log: cfg.Logger,
+		alertSnapshot: cfg.AlertSnapshot, maintSnapshot: cfg.MaintenanceSnapshot,
+		policy: cfg.Policy, log: cfg.Logger,
 		joined: map[uint32]*pubsub.Topic{}, shardSubs: map[uint32]*shardReader{},
 	}
 
@@ -510,6 +520,11 @@ func (n *Node) handleControlSyncStream(s network.Stream) {
 			resp.Alerts = capSlice(a, controlSyncMax)
 		}
 	}
+	if n.maintSnapshot != nil {
+		if mw, err := n.maintSnapshot(ctx); err == nil {
+			resp.Maintenance = capSlice(mw, controlSyncMax)
+		}
+	}
 	_ = json.NewEncoder(s).Encode(resp)
 }
 
@@ -544,9 +559,13 @@ func (n *Node) controlSyncFrom(ctx context.Context, p peer.ID) {
 	for _, sa := range resp.Alerts {
 		n.handleAlert(ctx, sa)
 	}
-	if len(resp.Catalog)+len(resp.Subscriptions)+len(resp.Alerts) > 0 {
+	for _, sm := range resp.Maintenance {
+		n.handleMaintenance(ctx, sm)
+	}
+	if len(resp.Catalog)+len(resp.Subscriptions)+len(resp.Alerts)+len(resp.Maintenance) > 0 {
 		n.log.Debug("control-sync: ingested from peer", "peer", p,
-			"catalog", len(resp.Catalog), "subs", len(resp.Subscriptions), "alerts", len(resp.Alerts))
+			"catalog", len(resp.Catalog), "subs", len(resp.Subscriptions), "alerts", len(resp.Alerts),
+			"maintenance", len(resp.Maintenance))
 	}
 }
 
@@ -627,6 +646,11 @@ func (n *Node) PublishAlert(ctx context.Context, sa protocol.SignedAlertRule) er
 // PublishDelivery gossips a signed delivery-state on the control topic.
 func (n *Node) PublishDelivery(ctx context.Context, sd protocol.SignedDeliveryState) error {
 	return n.publishControl(ctx, protocol.GossipEnvelope{Kind: protocol.GossipDelivery, Delivery: &sd})
+}
+
+// PublishMaintenance gossips a signed maintenance window on the control topic.
+func (n *Node) PublishMaintenance(ctx context.Context, sm protocol.SignedMaintenanceWindow) error {
+	return n.publishControl(ctx, protocol.GossipEnvelope{Kind: protocol.GossipMaintenance, Maintenance: &sm})
 }
 
 func (n *Node) publishControl(ctx context.Context, env protocol.GossipEnvelope) error {
@@ -807,6 +831,10 @@ func (n *Node) controlReadLoop(ctx context.Context) {
 			if env.Delivery != nil {
 				n.handleDelivery(ctx, *env.Delivery)
 			}
+		case protocol.GossipMaintenance:
+			if env.Maintenance != nil {
+				n.handleMaintenance(ctx, *env.Maintenance)
+			}
 		}
 	}
 }
@@ -903,6 +931,17 @@ func (n *Node) handleDelivery(ctx context.Context, sd protocol.SignedDeliverySta
 	}
 	if n.ingestDelivery != nil {
 		n.ingestDelivery(ctx, sd)
+	}
+}
+
+// handleMaintenance verifies an owner-signed maintenance window before ingesting it.
+func (n *Node) handleMaintenance(ctx context.Context, sm protocol.SignedMaintenanceWindow) {
+	if err := sm.Verify(); err != nil {
+		n.log.Debug("dropping unverifiable maintenance window", "err", err)
+		return
+	}
+	if n.ingestMaintenance != nil {
+		n.ingestMaintenance(ctx, sm)
 	}
 }
 

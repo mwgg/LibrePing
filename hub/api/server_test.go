@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,6 +57,358 @@ func TestSubmitRejectsTamperedResult(t *testing.T) {
 	stored, _ := st.Recent(context.Background(), 10)
 	if len(stored) != 0 {
 		t.Fatal("tampered result was stored")
+	}
+}
+
+// TestUptimeEndpoint seeds a check with a known up/down/degraded mix and asserts
+// the /uptime endpoint returns sample-weighted (up+degraded)/samples per window,
+// with the 24h number computed at hourly granularity.
+func TestUptimeEndpoint(t *testing.T) {
+	srv, st := newTestServer()
+	ctx := context.Background()
+	now := int64(40_000) * 86_400_000 // day-aligned "now"
+	srv.now = func() time.Time { return time.UnixMilli(now) }
+
+	hourMS := int64(3_600_000)
+	// Two distinct hours inside the last 24h: 8 up, 1 down, 1 degraded.
+	for i := int64(0); i < 4; i++ {
+		_ = st.Insert(ctx, seedRes("c", now-2*hourMS+i, protocol.StatusUp))
+		_ = st.Insert(ctx, seedRes("c", now-20*hourMS+i, protocol.StatusUp))
+	}
+	_ = st.Insert(ctx, seedRes("c", now-2*hourMS+100, protocol.StatusDown))
+	_ = st.Insert(ctx, seedRes("c", now-20*hourMS+100, protocol.StatusDegraded))
+
+	rec := do(srv, http.MethodGet, "/api/v1/uptime?check_id=c", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var rep store.UptimeReport
+	if err := json.Unmarshal(rec.Body.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.CheckID != "c" {
+		t.Fatalf("check_id: got %q", rep.CheckID)
+	}
+	w := rep.Windows["24h"]
+	if !w.Available || w.Samples != 10 || w.Up != 8 || w.Down != 1 || w.Degraded != 1 {
+		t.Fatalf("24h totals: got %+v", w)
+	}
+	if w.Uptime == nil || *w.Uptime != 0.9 { // (8 up + 1 degraded) / 10
+		t.Fatalf("24h uptime: got %v, want 0.9", w.Uptime)
+	}
+	// A window with no samples in it is present but unavailable, not an error.
+	if empty, ok := rep.Windows["7d"]; !ok || !empty.Available {
+		// 7d also contains the same samples, so it is available; sanity only.
+		t.Logf("7d window: %+v", empty)
+	}
+}
+
+// TestUptimeBadgeSVG seeds a held check, requests its badge, and asserts a
+// well-formed SVG carrying the formatted percentage and the correct content type.
+func TestUptimeBadgeSVG(t *testing.T) {
+	srv, st := newTestServer()
+	ctx := context.Background()
+	now := int64(40_000) * 86_400_000
+	srv.now = func() time.Time { return time.UnixMilli(now) }
+	dayMS := int64(86_400_000)
+	// Within 30d: 9 up, 1 down → 90.0% uptime (red band).
+	for i := int64(0); i < 9; i++ {
+		_ = st.Insert(ctx, seedRes("c", now-2*dayMS+i, protocol.StatusUp))
+	}
+	_ = st.Insert(ctx, seedRes("c", now-2*dayMS+100, protocol.StatusDown))
+
+	rec := do(srv, http.MethodGet, "/api/v1/uptime/badge.svg?check_id=c", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "image/svg+xml; charset=utf-8" {
+		t.Fatalf("content-type: got %q", ct)
+	}
+	body := rec.Body.String()
+	if !strings.HasPrefix(body, "<svg") || !strings.HasSuffix(body, "</svg>") {
+		t.Fatalf("not a well-formed svg: %q", body)
+	}
+	for _, want := range []string{"90.0%", "uptime 30d"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("badge missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "n/a") {
+		t.Fatalf("held check should not render n/a: %s", body)
+	}
+}
+
+// TestUptimeBadgeWindow honors an explicit valid window and rejects an unknown one.
+func TestUptimeBadgeWindow(t *testing.T) {
+	srv, _ := newTestServer()
+	if rec := do(srv, http.MethodGet, "/api/v1/uptime/badge.svg?check_id=c&window=7d", nil); rec.Code != http.StatusOK {
+		t.Fatalf("valid window: expected 200, got %d", rec.Code)
+	} else if !strings.Contains(rec.Body.String(), "uptime 7d") {
+		t.Fatalf("expected 7d label: %s", rec.Body.String())
+	}
+	if rec := do(srv, http.MethodGet, "/api/v1/uptime/badge.svg?check_id=c&window=bogus", nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad window: expected 400, got %d", rec.Code)
+	}
+}
+
+// TestUptimeBadgeUnknownCheck renders a valid grey "n/a" badge (not an error) for a
+// check with no local data.
+func TestUptimeBadgeUnknownCheck(t *testing.T) {
+	srv, _ := newTestServer()
+	rec := do(srv, http.MethodGet, "/api/v1/uptime/badge.svg?check_id=nope", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.HasPrefix(body, "<svg") || !strings.HasSuffix(body, "</svg>") || !strings.Contains(body, "n/a") {
+		t.Fatalf("expected a well-formed n/a badge: %s", body)
+	}
+}
+
+// TestUptimeBadgeMissingCheckID rejects a badge request without check_id.
+func TestUptimeBadgeMissingCheckID(t *testing.T) {
+	srv, _ := newTestServer()
+	if rec := do(srv, http.MethodGet, "/api/v1/uptime/badge.svg", nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+// TestUptimeMissingCheckID rejects a request without check_id.
+func TestUptimeMissingCheckID(t *testing.T) {
+	srv, _ := newTestServer()
+	rec := do(srv, http.MethodGet, "/api/v1/uptime", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+// TestUptimeUnknownCheck: a check the hub has no data for reports every window
+// unavailable (null uptime), not an error.
+func TestUptimeUnknownCheck(t *testing.T) {
+	srv, _ := newTestServer()
+	rec := do(srv, http.MethodGet, "/api/v1/uptime?check_id=nope", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var rep store.UptimeReport
+	_ = json.Unmarshal(rec.Body.Bytes(), &rep)
+	for _, label := range []string{"24h", "7d", "30d"} {
+		if w := rep.Windows[label]; w.Available || w.Uptime != nil {
+			t.Fatalf("%s should be unavailable/null, got %+v", label, w)
+		}
+	}
+}
+
+// TestUptimeNonHeldShard: a hub that does not hold the check's shard reports
+// every window unavailable without reaching across the mesh (local-only).
+func TestUptimeNonHeldShard(t *testing.T) {
+	noInterest := interest.New()
+	noInterest.Update(false, map[uint32]bool{}, map[string]bool{}) // holds nothing
+	srv := New(Config{Store: store.NewMemStore(), Interest: noInterest})
+
+	rec := do(srv, http.MethodGet, "/api/v1/uptime?check_id=abcd1234abcd1234", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var rep store.UptimeReport
+	_ = json.Unmarshal(rec.Body.Bytes(), &rep)
+	if len(rep.Windows) != 3 {
+		t.Fatalf("expected 3 windows, got %d", len(rep.Windows))
+	}
+	for label, w := range rep.Windows {
+		if w.Available || w.Uptime != nil {
+			t.Fatalf("%s should be unavailable on a non-holder, got %+v", label, w)
+		}
+	}
+}
+
+func seedRes(checkID string, ts int64, st protocol.Status) protocol.SignedResult {
+	return protocol.SignedResult{Content: protocol.ResultContent{
+		ProbeID: "p", CheckID: checkID, Status: st, TimestampMS: ts,
+	}}
+}
+
+func seedResRTT(checkID string, ts int64, st protocol.Status, rtt float64) protocol.SignedResult {
+	return protocol.SignedResult{Content: protocol.ResultContent{
+		ProbeID: "p", CheckID: checkID, Status: st, TimestampMS: ts, RTTMillis: rtt,
+	}}
+}
+
+// TestLatencyEndpoint seeds a known RTT distribution and asserts the /latency
+// endpoint returns nearest-rank p50/p95/p99 plus min/max/count over the window.
+func TestLatencyEndpoint(t *testing.T) {
+	srv, st := newTestServer()
+	ctx := context.Background()
+	now := int64(40_000) * 86_400_000
+	srv.now = func() time.Time { return time.UnixMilli(now) }
+	hourMS := int64(3_600_000)
+	// rtt = 1..100 ms inside the last 24h → p50=50, p95=95, p99=99, min=1, max=100.
+	for i := int64(1); i <= 100; i++ {
+		_ = st.Insert(ctx, seedResRTT("c", now-hourMS+i, protocol.StatusUp, float64(i)))
+	}
+	// A down row with a big rtt must not skew the percentiles.
+	_ = st.Insert(ctx, seedResRTT("c", now-hourMS+200, protocol.StatusDown, 9999))
+
+	rec := do(srv, http.MethodGet, "/api/v1/latency?check_id=c&window=24h", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var rep store.LatencyPercentiles
+	if err := json.Unmarshal(rec.Body.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Available || rep.Count != 100 || rep.CheckID != "c" || rep.Window != "24h" {
+		t.Fatalf("unexpected report: %+v", rep)
+	}
+	if rep.P50 == nil || *rep.P50 != 50 || rep.P95 == nil || *rep.P95 != 95 ||
+		rep.P99 == nil || *rep.P99 != 99 || rep.Min == nil || *rep.Min != 1 || rep.Max == nil || *rep.Max != 100 {
+		t.Fatalf("percentiles: got %+v", rep)
+	}
+}
+
+// TestLatencyDefaultWindow: omitting window defaults to 24h.
+func TestLatencyDefaultWindow(t *testing.T) {
+	srv, st := newTestServer()
+	ctx := context.Background()
+	now := int64(40_000) * 86_400_000
+	srv.now = func() time.Time { return time.UnixMilli(now) }
+	_ = st.Insert(ctx, seedResRTT("c", now-1000, protocol.StatusUp, 12))
+
+	rec := do(srv, http.MethodGet, "/api/v1/latency?check_id=c", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var rep store.LatencyPercentiles
+	_ = json.Unmarshal(rec.Body.Bytes(), &rep)
+	if rep.Window != "24h" || !rep.Available || rep.Count != 1 {
+		t.Fatalf("expected 24h/available/count=1, got %+v", rep)
+	}
+}
+
+// TestLatencyBadWindow rejects an unknown window label.
+func TestLatencyBadWindow(t *testing.T) {
+	srv, _ := newTestServer()
+	if rec := do(srv, http.MethodGet, "/api/v1/latency?check_id=c&window=bogus", nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+// TestLatencyMissingCheckID rejects a request without check_id.
+func TestLatencyMissingCheckID(t *testing.T) {
+	srv, _ := newTestServer()
+	if rec := do(srv, http.MethodGet, "/api/v1/latency", nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+// TestLatencyUnknownCheck: a check with no local data is available:false, not error.
+func TestLatencyUnknownCheck(t *testing.T) {
+	srv, _ := newTestServer()
+	rec := do(srv, http.MethodGet, "/api/v1/latency?check_id=nope", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var rep store.LatencyPercentiles
+	_ = json.Unmarshal(rec.Body.Bytes(), &rep)
+	if rep.Available || rep.P50 != nil || rep.Count != 0 {
+		t.Fatalf("expected unavailable/nil/zero, got %+v", rep)
+	}
+}
+
+// TestLatencyNonHeldShard: a hub that does not hold the check's shard reports the
+// window unavailable without reaching across the mesh (local-only).
+func TestLatencyNonHeldShard(t *testing.T) {
+	noInterest := interest.New()
+	noInterest.Update(false, map[uint32]bool{}, map[string]bool{}) // holds nothing
+	srv := New(Config{Store: store.NewMemStore(), Interest: noInterest})
+
+	rec := do(srv, http.MethodGet, "/api/v1/latency?check_id=abcd1234abcd1234&window=7d", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var rep store.LatencyPercentiles
+	_ = json.Unmarshal(rec.Body.Bytes(), &rep)
+	if rep.Available || rep.P50 != nil || rep.Window != "7d" {
+		t.Fatalf("expected unavailable on a non-holder, got %+v", rep)
+	}
+}
+
+// TestIncidentsEndpoint seeds an up→down→up pattern and asserts the /incidents
+// endpoint returns one bucket-aligned incident with the right worst status.
+func TestIncidentsEndpoint(t *testing.T) {
+	srv, st := newTestServer()
+	ctx := context.Background()
+	now := int64(40_000) * 86_400_000
+	srv.now = func() time.Time { return time.UnixMilli(now) }
+	hourMS := int64(3_600_000)
+	_ = st.Insert(ctx, seedRes("c", now-4*hourMS, protocol.StatusUp))
+	for i := int64(0); i < 3; i++ {
+		_ = st.Insert(ctx, seedRes("c", now-3*hourMS+i, protocol.StatusDown))
+	}
+	_ = st.Insert(ctx, seedRes("c", now-2*hourMS, protocol.StatusUp))
+
+	rec := do(srv, http.MethodGet, "/api/v1/incidents?check_id=c&window=7d", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var rep store.IncidentReport
+	if err := json.Unmarshal(rec.Body.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Window != "7d" || rep.Resolution != "hourly" || len(rep.Incidents) != 1 {
+		t.Fatalf("unexpected report: %+v", rep)
+	}
+	inc := rep.Incidents[0]
+	if inc.WorstStatus != "down" || inc.BucketCount != 1 || inc.Ongoing {
+		t.Fatalf("incident: %+v", inc)
+	}
+}
+
+// TestIncidentsDefaultWindow: omitting window defaults to 30d (daily resolution).
+func TestIncidentsDefaultWindow(t *testing.T) {
+	srv, _ := newTestServer()
+	rec := do(srv, http.MethodGet, "/api/v1/incidents?check_id=c", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var rep store.IncidentReport
+	_ = json.Unmarshal(rec.Body.Bytes(), &rep)
+	if rep.Window != "30d" || rep.Resolution != "daily" || len(rep.Incidents) != 0 {
+		t.Fatalf("expected empty 30d/daily report, got %+v", rep)
+	}
+}
+
+// TestIncidentsBadWindow rejects an unknown window label.
+func TestIncidentsBadWindow(t *testing.T) {
+	srv, _ := newTestServer()
+	if rec := do(srv, http.MethodGet, "/api/v1/incidents?check_id=c&window=bogus", nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+// TestIncidentsMissingCheckID rejects a request without check_id.
+func TestIncidentsMissingCheckID(t *testing.T) {
+	srv, _ := newTestServer()
+	if rec := do(srv, http.MethodGet, "/api/v1/incidents", nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+// TestIncidentsNonHeldShard: a hub that does not hold the check's shard reports an
+// empty timeline without reaching across the mesh (local-only).
+func TestIncidentsNonHeldShard(t *testing.T) {
+	noInterest := interest.New()
+	noInterest.Update(false, map[uint32]bool{}, map[string]bool{}) // holds nothing
+	srv := New(Config{Store: store.NewMemStore(), Interest: noInterest})
+
+	rec := do(srv, http.MethodGet, "/api/v1/incidents?check_id=abcd1234abcd1234&window=7d", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var rep store.IncidentReport
+	_ = json.Unmarshal(rec.Body.Bytes(), &rep)
+	if rep.Window != "7d" || len(rep.Incidents) != 0 {
+		t.Fatalf("expected empty on a non-holder, got %+v", rep)
 	}
 }
 

@@ -32,6 +32,7 @@ type Engine struct {
 	self            string
 	alerts          store.AlertStore
 	results         store.ResultStore
+	maint           store.MaintenanceStore
 	peerHubs        func() []string // live verified peer hub IDs (short liveness window)
 	open            Opener
 	publishDelivery func(ctx context.Context, sd protocol.SignedDeliveryState)
@@ -41,13 +42,15 @@ type Engine struct {
 }
 
 // NewEngine builds an alert engine. open decrypts destinations sealed to this
-// hub; publishDelivery gossips a delivery-state after a successful send.
-func NewEngine(id *identity.Identity, alerts store.AlertStore, results store.ResultStore, peerHubs func() []string, open Opener, publishDelivery func(ctx context.Context, sd protocol.SignedDeliveryState), notifiers map[protocol.AlertChannel]Notifier, log *slog.Logger) *Engine {
+// hub; publishDelivery gossips a delivery-state after a successful send. maint
+// supplies planned-downtime windows that suppress "down" alerts; it may be nil
+// (no suppression).
+func NewEngine(id *identity.Identity, alerts store.AlertStore, results store.ResultStore, maint store.MaintenanceStore, peerHubs func() []string, open Opener, publishDelivery func(ctx context.Context, sd protocol.SignedDeliveryState), notifiers map[protocol.AlertChannel]Notifier, log *slog.Logger) *Engine {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Engine{
-		id: id, self: id.NodeID(), alerts: alerts, results: results, peerHubs: peerHubs,
+		id: id, self: id.NodeID(), alerts: alerts, results: results, maint: maint, peerHubs: peerHubs,
 		open: open, publishDelivery: publishDelivery, notifiers: notifiers, log: log, now: time.Now,
 	}
 }
@@ -106,6 +109,14 @@ func (e *Engine) Evaluate(ctx context.Context) {
 		if !ok {
 			continue // no data yet
 		}
+		// Planned downtime: while the check is inside an active maintenance window,
+		// suppress a "down" alert and do NOT advance the delivered state (skip the
+		// rule entirely). A recovery ("up") is still delivered so a service that
+		// comes back mid-window clears any earlier down. Once the window ends,
+		// normal evaluation resumes — so a still-down service alerts then.
+		if observed == protocol.StatusDown && e.underMaintenance(ctx, rule.CheckID, now) {
+			continue
+		}
 		// Compare against what has actually been DELIVERED (locally or by a peer
 		// we learned from via gossip). Anything not yet delivered is (re)tried;
 		// the delivered state only advances on a successful send below.
@@ -138,6 +149,21 @@ func (e *Engine) deliveredStatus(ctx context.Context, rule protocol.AlertRule) p
 		return protocol.StatusUp
 	}
 	return newest.Status
+}
+
+// underMaintenance reports whether the check is inside an active planned-downtime
+// window at time nowMS. A nil store or a lookup error means "not in maintenance"
+// (fail open: never silently swallow a real alert on a maintenance-store hiccup).
+func (e *Engine) underMaintenance(ctx context.Context, checkID string, nowMS int64) bool {
+	if e.maint == nil {
+		return false
+	}
+	intervals, err := e.maint.IntervalsForCheck(ctx, checkID)
+	if err != nil {
+		e.log.Warn("alert: maintenance lookup", "check", checkID, "err", err)
+		return false
+	}
+	return store.InMaintenance(nowMS, intervals)
 }
 
 // deliver decrypts the destination, notifies, and — only on success — records
