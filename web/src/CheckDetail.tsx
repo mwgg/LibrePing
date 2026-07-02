@@ -523,8 +523,10 @@ function useLatency(checkId: string): Partial<Record<UptimeWindowKey, LatencyPer
 // LatencySummary shows the p50 / p95 / p99 latency percentiles for one window,
 // with a small 24h/7d/30d toggle. All three windows are fetched up front (see
 // useLatency), so switching is instant. Values render in ms via fmtRtt to match
-// the latency figures elsewhere; a subtle caption reports the sample count so a
-// raw-limited long window (30d is bounded by the ~7d raw retention) is honest.
+// the latency figures elsewhere; a subtle caption reports the sample count and
+// how the selected window's percentiles were derived (exact nearest-rank over the
+// raw window, or histogram-interpolated from latency buckets for windows longer
+// than raw retention — 30d) so a raw-limited long window is honest.
 function LatencySummary({ checkId }: { checkId: string }) {
   const byWindow = useLatency(checkId);
   const [win, setWin] = useState<UptimeWindowKey>("24h");
@@ -566,7 +568,8 @@ function LatencySummary({ checkId }: { checkId: string }) {
       </div>
       {byWindow !== null && avail && cur && (
         <span className="muted note">
-          Nearest-rank over {cur.count} sample{cur.count === 1 ? "" : "s"} in the {win} window.
+          {cur.source === "histogram" ? "Histogram-interpolated from latency buckets over" : "Nearest-rank over"} {cur.count} sample
+          {cur.count === 1 ? "" : "s"} in the {win} window.
         </span>
       )}
     </div>

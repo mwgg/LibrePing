@@ -164,7 +164,10 @@ export async function uptime(checkId: string): Promise<UptimeReport> {
 // is false when this hub doesn't hold the check or has no measured samples (then
 // render "n/a"). `count` is the number of samples that fed the percentiles —
 // note long windows are raw-limited (on Postgres the raw window is ~7d), so a
-// 30d request's `count` reflects actual coverage, not a full 30 days.
+// 30d request's `count` reflects actual coverage, not a full 30 days. `source`
+// tells how the percentiles were derived: "raw" (exact nearest-rank over the raw
+// window) or "histogram" (interpolated from aggregate latency-bucket counts, used
+// for windows longer than raw retention). Omitted by the backend when empty.
 export interface LatencyPercentiles {
   check_id: string;
   window: UptimeWindowKey;
@@ -175,6 +178,7 @@ export interface LatencyPercentiles {
   max: number | null;
   count: number;
   available: boolean;
+  source?: "raw" | "histogram";
 }
 
 // latency fetches the latency percentile distribution for one check over one

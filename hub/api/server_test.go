@@ -266,6 +266,46 @@ func TestLatencyEndpoint(t *testing.T) {
 	}
 }
 
+// TestLatencySourceSelection: a window within raw retention (24h) is answered from
+// raw (source "raw"); a window longer than raw retention (30d, > the default 7d) is
+// answered from the aggregate latency histogram (source "histogram"). The default
+// test server uses the default raw retention.
+func TestLatencySourceSelection(t *testing.T) {
+	srv, st := newTestServer()
+	ctx := context.Background()
+	now := int64(40_000) * 86_400_000
+	srv.now = func() time.Time { return time.UnixMilli(now) }
+	dayMS := int64(86_400_000)
+	// Seed measured samples across a 30d span so both windows have data.
+	for i := int64(1); i <= 100; i++ {
+		ts := now - int64(30)*dayMS + i*(int64(30)*dayMS)/101
+		_ = st.Insert(ctx, seedResRTT("c", ts, protocol.StatusUp, float64(i)))
+	}
+	// A few recent samples inside 24h for the raw path.
+	for i := int64(1); i <= 10; i++ {
+		_ = st.Insert(ctx, seedResRTT("c", now-int64(3_600_000)+i, protocol.StatusUp, float64(i)))
+	}
+
+	get := func(window string) store.LatencyPercentiles {
+		rec := do(srv, http.MethodGet, "/api/v1/latency?check_id=c&window="+window, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200, got %d", window, rec.Code)
+		}
+		var rep store.LatencyPercentiles
+		if err := json.Unmarshal(rec.Body.Bytes(), &rep); err != nil {
+			t.Fatal(err)
+		}
+		return rep
+	}
+	if raw := get("24h"); raw.Source != "raw" || !raw.Available {
+		t.Fatalf("24h should be raw+available, got %+v", raw)
+	}
+	hist := get("30d")
+	if hist.Source != "histogram" || !hist.Available || hist.P50 == nil {
+		t.Fatalf("30d should be histogram+available with percentiles, got %+v", hist)
+	}
+}
+
 // TestLatencyDefaultWindow: omitting window defaults to 24h.
 func TestLatencyDefaultWindow(t *testing.T) {
 	srv, st := newTestServer()

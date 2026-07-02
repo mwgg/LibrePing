@@ -58,21 +58,28 @@ type ResultStore interface {
 // aggregates the hub computed locally; unlike a Result they are not individually
 // probe-signed.
 type HistorySummary struct {
-	BucketMS      int64             `json:"bucket_ms"`
-	Resolution    string            `json:"resolution"`
-	CheckID       string            `json:"check_id"`
-	ProbeID       string            `json:"probe_id"`
-	Samples       int64             `json:"samples"`
-	UpCount       int64             `json:"up_count"`
-	DownCount     int64             `json:"down_count"`
-	DegradedCount int64             `json:"degraded_count"`
-	RTTAvg        float64           `json:"rtt_avg"`
-	RTTMin        float64           `json:"rtt_min"`
-	RTTMax        float64           `json:"rtt_max"`
-	LastStatus    string            `json:"last_status"`
-	CheckType     string            `json:"check_type"`
-	Target        string            `json:"target"`
-	Location      protocol.Location `json:"location"`
+	BucketMS      int64   `json:"bucket_ms"`
+	Resolution    string  `json:"resolution"`
+	CheckID       string  `json:"check_id"`
+	ProbeID       string  `json:"probe_id"`
+	Samples       int64   `json:"samples"`
+	UpCount       int64   `json:"up_count"`
+	DownCount     int64   `json:"down_count"`
+	DegradedCount int64   `json:"degraded_count"`
+	RTTAvg        float64 `json:"rtt_avg"`
+	RTTMin        float64 `json:"rtt_min"`
+	RTTMax        float64 `json:"rtt_max"`
+	// RTTSamples is the MEASURED sample count (down/0-rtt excluded) backing the RTT
+	// stats and the histogram denominator. RttBuckets holds cumulative latency-bucket
+	// counts (le_<bound>: measured samples with rtt_ms <= RttBucketBoundsMS[i]); the
+	// overflow (rtt > last bound) is RTTSamples - RttBuckets[last]. Together they let
+	// HistogramPercentiles interpolate percentiles over aggregate-retention windows.
+	RTTSamples int64                `json:"rtt_samples"`
+	RttBuckets [numRttBuckets]int64 `json:"rtt_buckets"`
+	LastStatus string               `json:"last_status"`
+	CheckType  string               `json:"check_type"`
+	Target     string               `json:"target"`
+	Location   protocol.Location    `json:"location"`
 }
 
 // ProbeSeen is a probe observed in the result stream: its most recent
@@ -273,6 +280,14 @@ func (m *MemStore) HistoryRange(_ context.Context, checkID string, fromMS, toMS 
 			}
 			a.rttSum += c.RTTMillis
 			a.rttN++
+			// Tally the cumulative latency buckets (le_<bound>), mirroring the SQL
+			// count(*) FILTER (rtt_ms <= bound): a sample lands in every bucket whose
+			// bound it is <= to. Same measured set as rttN.
+			for i, bound := range RttBucketBoundsMS {
+				if c.RTTMillis <= float64(bound) {
+					a.s.RttBuckets[i]++
+				}
+			}
 		}
 		if c.TimestampMS >= a.lastTS {
 			a.lastTS = c.TimestampMS
@@ -284,6 +299,7 @@ func (m *MemStore) HistoryRange(_ context.Context, checkID string, fromMS, toMS 
 	}
 	out := make([]HistorySummary, 0, len(buckets))
 	for _, a := range buckets {
+		a.s.RTTSamples = a.rttN
 		if a.rttN > 0 {
 			a.s.RTTAvg = a.rttSum / float64(a.rttN)
 		}

@@ -261,6 +261,7 @@ func main() {
 		SelfHub:           selfHub,
 		AllowPrivatePeers: allowPrivatePeers,
 		Outbox:            ob,
+		RawRetentionDays:  atoiDefault(os.Getenv("RESULT_RETENTION_DAYS"), store.DefaultTierConfig().RawRetentionDays),
 		Logger:            log,
 	})
 

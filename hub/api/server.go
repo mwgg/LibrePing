@@ -114,6 +114,7 @@ type Server struct {
 	allowPriv   bool
 	remote      *remote.Client
 	outbox      *outbox.Outbox
+	rawRetMS    int64 // raw-retention boundary for latency raw-vs-histogram selection
 
 	mu     sync.Mutex
 	probes map[string]registeredProbe
@@ -175,6 +176,12 @@ type Config struct {
 	// anti-entropy, so a non-holder home hub never silently drops a submission.
 	// Nil disables retention (a hub that holds everything never needs it).
 	Outbox *outbox.Outbox
+	// RawRetentionDays is how many days of raw results this hub keeps (mirrors
+	// RESULT_RETENTION_DAYS / TierConfig.RawRetentionDays). It sets the raw-vs-
+	// histogram boundary for GET /api/v1/latency: a window within it is answered
+	// exactly from raw results, a longer one from the aggregates' latency
+	// histogram. 0 uses the DefaultTierConfig value.
+	RawRetentionDays int
 }
 
 // New builds a Server.
@@ -209,6 +216,14 @@ func New(cfg Config) *Server {
 	if rate == 0 {
 		rate = 120
 	}
+	// Raw-retention boundary for latency raw-vs-histogram selection. 0 means
+	// "unset" here → use the default; a genuinely keep-forever hub (env 0) also
+	// falls back to the default boundary, switching to the histogram beyond it —
+	// consistent, since the histogram is derived from the same measured stream.
+	rawRetDays := cfg.RawRetentionDays
+	if rawRetDays <= 0 {
+		rawRetDays = store.DefaultTierConfig().RawRetentionDays
+	}
 	return &Server{
 		store:       cfg.Store,
 		catalog:     cfg.Catalog,
@@ -233,6 +248,7 @@ func New(cfg Config) *Server {
 		allowPriv:   cfg.AllowPrivatePeers,
 		remote:      remote.NewClient(cfg.AllowPrivatePeers),
 		outbox:      cfg.Outbox,
+		rawRetMS:    int64(rawRetDays) * 24 * int64(time.Hour/time.Millisecond),
 		probes:      map[string]registeredProbe{},
 		now:         time.Now,
 		remoteCache: map[string]cachedResults{},
@@ -675,17 +691,20 @@ func (s *Server) handleUptime(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rep)
 }
 
-// handleLatency serves a check's RTT percentiles (nearest-rank p50/p95/p99) plus
-// min/max/count over one rolling window (?window=24h|7d|30d), computed from this
-// hub's local RAW results. The default window is 24h.
+// handleLatency serves a check's RTT percentiles (p50/p95/p99) plus min/max/count
+// over one rolling window (?window=24h|7d|30d), from this hub's local data. The
+// default window is 24h.
+//
+// A window WITHIN raw retention is computed EXACTLY from raw results (nearest-rank,
+// source "raw"). A window LONGER than raw retention is computed by interpolating
+// the aggregates' latency-bucket histogram (source "histogram"), which survives the
+// full aggregate retention (90d hourly / 730d daily) — so a 30d window stays
+// accurate on a Postgres hub even after raw results age out. The histogram is
+// bucket-interpolated (see store.HistogramPercentiles), so it is accurate-enough
+// rather than exact, softest in a sparse tail.
 //
 // Like handleUptime this is LOCAL-ONLY: a hub that does not hold the check's shard
-// reports the window unavailable rather than fetching from a holder. Because it
-// reads RAW results, coverage is capped by raw retention (~7d on Postgres), so a
-// 30d window reflects only the surviving raw window there — Count reports the
-// measured sample set that actually backed the numbers. Longer-window percentiles
-// from the aggregates are deferred pending a TimescaleDB toolkit tdigest column
-// (see hub/store/tiering.go).
+// reports the window unavailable rather than fetching from a holder.
 func (s *Server) handleLatency(w http.ResponseWriter, r *http.Request) {
 	checkID := r.URL.Query().Get("check_id")
 	if checkID == "" || len(checkID) > maxCheckIDLen {
@@ -696,7 +715,8 @@ func (s *Server) handleLatency(w http.ResponseWriter, r *http.Request) {
 	if window == "" {
 		window = "24h"
 	}
-	if _, ok := store.LatencyWindows[window]; !ok {
+	span, ok := store.LatencyWindows[window]
+	if !ok {
 		http.Error(w, "window must be one of 24h, 7d, 30d", http.StatusBadRequest)
 		return
 	}
@@ -706,12 +726,24 @@ func (s *Server) handleLatency(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, store.EmptyLatencyPercentiles(checkID, window))
 		return
 	}
-	rep, err := store.ComputeLatencyPercentiles(r.Context(), s.store, checkID, window, s.now().UnixMilli())
+	now := s.now().UnixMilli()
+	// Within raw retention: exact nearest-rank over raw. Beyond it: interpolate the
+	// aggregates' latency histogram, which survives past raw retention.
+	if span <= s.rawRetMS {
+		rep, err := store.ComputeLatencyPercentiles(r.Context(), s.store, checkID, window, now)
+		if err != nil {
+			http.Error(w, "storage error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, rep)
+		return
+	}
+	summaries, err := s.store.HistoryRange(r.Context(), checkID, now-span, now)
 	if err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, rep)
+	writeJSON(w, http.StatusOK, store.HistogramPercentiles(checkID, window, summaries))
 }
 
 // handleIncidents serves a check's outage timeline (?window=24h|7d|30d, default
