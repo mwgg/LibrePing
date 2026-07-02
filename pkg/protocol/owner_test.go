@@ -78,6 +78,36 @@ func TestAlertRuleCanonicalNoCollision(t *testing.T) {
 	}
 }
 
+func TestMaintenanceSignVerifyTamper(t *testing.T) {
+	owner, _ := identity.Generate()
+	sm := SignMaintenanceWindow(owner, MaintenanceWindow{
+		CheckID: "abc123", StartMS: 1000, EndMS: 2000, Reason: "db upgrade",
+		ExpiryMS: 3000, UpdatedMS: 500,
+	})
+	if sm.Window.Owner != owner.NodeID() {
+		t.Fatal("owner not stamped")
+	}
+	if err := sm.Verify(); err != nil {
+		t.Fatalf("valid maintenance window failed to verify: %v", err)
+	}
+	// Extending the window (hiding downtime) breaks the signature.
+	sm.Window.EndMS = 9_999_999
+	if err := sm.Verify(); err == nil {
+		t.Fatal("tampered maintenance window verified")
+	}
+}
+
+// TestMaintenanceCanonicalNoCollision proves the length-prefixed encoding is
+// injective across field boundaries: moving bytes from one field into an
+// adjacent one changes the canonical payload, so it can't forge a collision.
+func TestMaintenanceCanonicalNoCollision(t *testing.T) {
+	a := MaintenanceWindow{Owner: "o", CheckID: "ab", Reason: "cd"}
+	b := MaintenanceWindow{Owner: "o", CheckID: "abc", Reason: "d"}
+	if string(a.canonical()) == string(b.canonical()) {
+		t.Fatal("length-prefixed canonical collided across a field boundary")
+	}
+}
+
 // fixedSeed is a deterministic key used only for the cross-language vectors.
 var fixedSeed = []byte{
 	1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
@@ -106,17 +136,27 @@ func TestCrossLanguageVectors(t *testing.T) {
 	}
 	ruleSig := hex.EncodeToString(id.Sign(rule.canonical()))
 
+	maint := MaintenanceWindow{
+		Owner: id.NodeID(), CheckID: "7a0e21c6e134a0c0",
+		StartMS: 1700000000000, EndMS: 1700003600000, Reason: "planned db upgrade",
+		ExpiryMS: 1700007200000, UpdatedMS: 1699999999000,
+	}
+	maintSig := hex.EncodeToString(id.Sign(maint.canonical()))
+
 	t.Logf("node_id=%s", id.NodeID())
 	t.Logf("subscription canonical=%q", string(sub.canonical()))
 	t.Logf("subscription sig=%s", subSig)
 	t.Logf("alert canonical=%q", string(rule.canonical()))
 	t.Logf("alert sig=%s", ruleSig)
+	t.Logf("maintenance canonical=%q", string(maint.canonical()))
+	t.Logf("maintenance sig=%s", maintSig)
 
 	// Pinned vectors. web/src/identity.ts has the same seed + expected hex in
 	// its own test; both must match. Regenerate together if canonical() changes.
 	const wantNodeID = "65b60673d6ed884bf01c2c222d82ada0"
 	const wantSubSig = "dc079b7fbb2a61ca1ab313ff294fc769242d118665dd189626aa7bbbde0ae444b8f97baf7bcf54170359a4d6d5a2b5982745a231072e48a5dce7d2bc2024440d"
 	const wantRuleSig = "bb1690db21e7722cd6bd27e25fe345549fcd31d4174cbdcb07ffe8a7de01c16c188a7b397583436ad64f5f9982b2dd6baf09c5d5615e042974f181667e53c702"
+	const wantMaintSig = "203652a1fef19ee30590f1bb07fca5936f98ba4a155005ae525454158f94afa1c2f9fca9924ba2de8996d26e3e75dab713e17a51cf5f94e08cc2e8dbb3be0b02"
 	if id.NodeID() != wantNodeID {
 		t.Fatalf("node id drifted: got %s want %s", id.NodeID(), wantNodeID)
 	}
@@ -125,5 +165,8 @@ func TestCrossLanguageVectors(t *testing.T) {
 	}
 	if ruleSig != wantRuleSig {
 		t.Fatalf("alert signature drifted: got %s want %s", ruleSig, wantRuleSig)
+	}
+	if maintSig != wantMaintSig {
+		t.Fatalf("maintenance signature drifted: got %s want %s", maintSig, wantMaintSig)
 	}
 }

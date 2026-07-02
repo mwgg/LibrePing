@@ -286,6 +286,63 @@ func TestSubscriptionGossipVerify(t *testing.T) {
 	}
 }
 
+// TestMaintenanceGossipVerify confirms owner-signed maintenance windows
+// propagate and verify across hubs (and tampered ones are dropped).
+func TestMaintenanceGossipVerify(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	idA, _ := identity.Generate()
+	idB, _ := identity.Generate()
+	owner, _ := identity.Generate()
+
+	var mu sync.Mutex
+	var got []protocol.SignedMaintenanceWindow
+	ingestB := func(_ context.Context, sm protocol.SignedMaintenanceWindow) {
+		mu.Lock()
+		got = append(got, sm)
+		mu.Unlock()
+	}
+
+	a, err := New(ctx, Config{PrivateKey: idA.PrivateKey(), ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"}})
+	if err != nil {
+		t.Fatalf("new A: %v", err)
+	}
+	defer a.Close()
+	b, err := New(ctx, Config{PrivateKey: idB.PrivateKey(), ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"}, IngestMaintenance: ingestB})
+	if err != nil {
+		t.Fatalf("new B: %v", err)
+	}
+	defer b.Close()
+
+	if err := a.Connect(ctx, b.Addrs()[0]); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	waitForTopicPeer(t, a, b.ID())
+
+	valid := protocol.SignMaintenanceWindow(owner, protocol.MaintenanceWindow{CheckID: "abc", StartMS: 1000, EndMS: 2000, ExpiryMS: 9999})
+	waitFor(t, 15*time.Second, func() bool {
+		_ = a.PublishMaintenance(ctx, valid)
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) >= 1
+	}, "node B never ingested the maintenance window")
+
+	tampered := valid
+	tampered.Window.EndMS = 9_999_999 // extend downtime after signing
+	for i := 0; i < 5; i++ {
+		_ = a.PublishMaintenance(ctx, tampered)
+		time.Sleep(200 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, s := range got {
+		if s.Window.EndMS == 9_999_999 {
+			t.Fatal("tampered maintenance window was ingested")
+		}
+	}
+}
+
 // TestResultSyncOnConnect proves the catch-up sync: hub A already holds a
 // result that hub B never received via gossip (B was not connected when it was
 // published). When B connects, it pulls A's recent results over the sync stream

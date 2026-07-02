@@ -25,9 +25,9 @@ func TestMatchReplyEcho(t *testing.T) {
 	}
 
 	cases := []struct {
-		name  string
-		mut   func(r *icmpReply)
-		seq   int
+		name string
+		mut  func(r *icmpReply)
+		seq  int
 	}{
 		{"wrong id", func(r *icmpReply) { r.id = 0x9999 }, 5},
 		{"wrong seq", func(r *icmpReply) { r.seq = 6 }, 5},
@@ -97,7 +97,7 @@ func TestQuotedEcho(t *testing.T) {
 	// Minimal 20-byte IPv4 header (IHL=5) + 8-byte ICMP echo header.
 	data := make([]byte, 28)
 	data[0] = 0x45
-	data[24] = 8 // type = echo request
+	data[24] = 8                        // type = echo request
 	data[28-4], data[28-3] = 0x12, 0x34 // id
 	data[28-2], data[28-1] = 0x00, 0x07 // seq
 	id, seq, ok := quotedEcho(data)

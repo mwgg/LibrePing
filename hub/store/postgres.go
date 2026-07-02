@@ -190,8 +190,8 @@ func (s *PgStore) HistoryRange(ctx context.Context, checkID string, fromMS, toMS
 		view = "results_daily"
 	}
 	q := `SELECT bucket, probe_id, samples, up_count, down_count, degraded_count,
-	             rtt_avg, rtt_min, rtt_max, last_status, check_type, target,
-	             country, city, lat, lon
+	             rtt_samples, rtt_avg, rtt_min, rtt_max, ` + histBucketSelect + `,
+	             last_status, check_type, target, country, city, lat, lon
 	      FROM ` + view + `
 	      WHERE check_id = $1 AND bucket >= $2 AND bucket < $3
 	      ORDER BY bucket, probe_id`
@@ -203,13 +203,32 @@ func (s *PgStore) HistoryRange(ctx context.Context, checkID string, fromMS, toMS
 	var out []HistorySummary
 	for rows.Next() {
 		h := HistorySummary{Resolution: label, CheckID: checkID}
+		var rttSamples *int64
 		var rttAvg, rttMin, rttMax *float64
-		if err := rows.Scan(
+		// Latency-bucket counts (le_<bound>) can be NULL on an empty bucket, so scan
+		// into pointers and fold into the fixed-size array.
+		var le [numRttBuckets]*int64
+		dst := []any{
 			&h.BucketMS, &h.ProbeID, &h.Samples, &h.UpCount, &h.DownCount, &h.DegradedCount,
-			&rttAvg, &rttMin, &rttMax, &h.LastStatus, &h.CheckType, &h.Target,
+			&rttSamples, &rttAvg, &rttMin, &rttMax,
+		}
+		for i := range le {
+			dst = append(dst, &le[i])
+		}
+		dst = append(dst,
+			&h.LastStatus, &h.CheckType, &h.Target,
 			&h.Location.Country, &h.Location.City, &h.Location.Lat, &h.Location.Lon,
-		); err != nil {
+		)
+		if err := rows.Scan(dst...); err != nil {
 			return nil, err
+		}
+		if rttSamples != nil {
+			h.RTTSamples = *rttSamples
+		}
+		for i, v := range le {
+			if v != nil {
+				h.RttBuckets[i] = *v
+			}
 		}
 		if rttAvg != nil {
 			h.RTTAvg = *rttAvg

@@ -89,6 +89,7 @@ type Publisher interface {
 	PublishCatalog(ctx context.Context, sc protocol.SignedCatalogEntry) error
 	PublishSubscription(ctx context.Context, ss protocol.SignedSubscription) error
 	PublishAlert(ctx context.Context, sa protocol.SignedAlertRule) error
+	PublishMaintenance(ctx context.Context, sm protocol.SignedMaintenanceWindow) error
 }
 
 // noopPublisher is used when the hub runs without a mesh (e.g. tests).
@@ -100,6 +101,9 @@ func (noopPublisher) PublishSubscription(context.Context, protocol.SignedSubscri
 	return nil
 }
 func (noopPublisher) PublishAlert(context.Context, protocol.SignedAlertRule) error { return nil }
+func (noopPublisher) PublishMaintenance(context.Context, protocol.SignedMaintenanceWindow) error {
+	return nil
+}
 
 // minSubIntervalFloor caps how frequently subscribers can drive a check.
 const minSubIntervalFloor = 30
@@ -119,6 +123,7 @@ type Server struct {
 	catalog     store.CatalogStore
 	subs        store.SubscriptionStore
 	alerts      store.AlertStore
+	maint       store.MaintenanceStore
 	mesh        Publisher
 	identity    *identity.Identity
 	encPubKey   []byte
@@ -140,6 +145,7 @@ type Server struct {
 	allowPriv   bool
 	remote      *remote.Client
 	outbox      *outbox.Outbox
+	rawRetMS    int64 // raw-retention boundary for latency raw-vs-histogram selection
 
 	mu     sync.Mutex
 	probes map[string]registeredProbe
@@ -163,6 +169,7 @@ type Config struct {
 	Catalog       store.CatalogStore
 	Subscriptions store.SubscriptionStore
 	Alerts        store.AlertStore
+	Maintenance   store.MaintenanceStore
 	Mesh          Publisher
 	Identity      *identity.Identity
 	EncPubKey     []byte
@@ -214,6 +221,12 @@ type Config struct {
 	// anti-entropy, so a non-holder home hub never silently drops a submission.
 	// Nil disables retention (a hub that holds everything never needs it).
 	Outbox *outbox.Outbox
+	// RawRetentionDays is how many days of raw results this hub keeps (mirrors
+	// RESULT_RETENTION_DAYS / TierConfig.RawRetentionDays). It sets the raw-vs-
+	// histogram boundary for GET /api/v1/latency: a window within it is answered
+	// exactly from raw results, a longer one from the aggregates' latency
+	// histogram. 0 uses the DefaultTierConfig value.
+	RawRetentionDays int
 }
 
 // New builds a Server.
@@ -229,6 +242,9 @@ func New(cfg Config) *Server {
 	}
 	if cfg.Alerts == nil {
 		cfg.Alerts = store.NewMemAlerts()
+	}
+	if cfg.Maintenance == nil {
+		cfg.Maintenance = store.NewMemMaintenance()
 	}
 	if cfg.Policy == nil {
 		cfg.Policy = trust.Open{}
@@ -263,11 +279,20 @@ func New(cfg Config) *Server {
 	if readRate == 0 {
 		readRate = 1200
 	}
+	// Raw-retention boundary for latency raw-vs-histogram selection. 0 means
+	// "unset" here → use the default; a genuinely keep-forever hub (env 0) also
+	// falls back to the default boundary, switching to the histogram beyond it —
+	// consistent, since the histogram is derived from the same measured stream.
+	rawRetDays := cfg.RawRetentionDays
+	if rawRetDays <= 0 {
+		rawRetDays = store.DefaultTierConfig().RawRetentionDays
+	}
 	return &Server{
 		store:       cfg.Store,
 		catalog:     cfg.Catalog,
 		subs:        cfg.Subscriptions,
 		alerts:      cfg.Alerts,
+		maint:       cfg.Maintenance,
 		mesh:        cfg.Mesh,
 		identity:    cfg.Identity,
 		encPubKey:   cfg.EncPubKey,
@@ -289,6 +314,7 @@ func New(cfg Config) *Server {
 		allowPriv:   cfg.AllowPrivatePeers,
 		remote:      remote.NewClient(cfg.AllowPrivatePeers),
 		outbox:      cfg.Outbox,
+		rawRetMS:    int64(rawRetDays) * 24 * int64(time.Hour/time.Millisecond),
 		probes:      map[string]registeredProbe{},
 		now:         time.Now,
 		remoteCache: map[string]cachedResults{},
@@ -309,6 +335,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/results/recent", s.handleRecent)
 	mux.HandleFunc("GET /api/v1/results/query", s.readLimit.limit(s.handleQuery)) // holder query (by check_id or shard)
 	mux.HandleFunc("GET /api/v1/results/history", s.handleHistory)                // rolled-up history for one check
+	mux.HandleFunc("GET /api/v1/uptime", s.handleUptime)                          // sample-weighted uptime % over 24h/7d/30d
+	mux.HandleFunc("GET /api/v1/latency", s.handleLatency)                        // raw-window rtt percentiles (p50/p95/p99)
+	mux.HandleFunc("GET /api/v1/incidents", s.handleIncidents)                    // outage timeline over 24h/7d/30d (derived on read)
+	mux.HandleFunc("GET /api/v1/uptime/badge.svg", s.handleUptimeBadgeSVG)        // embeddable shields-style uptime badge
 	mux.HandleFunc("GET /api/v1/locations", s.handleLocations)
 	mux.HandleFunc("GET /api/v1/probes", s.handleProbes)                       // this hub's registered probes
 	mux.HandleFunc("GET /api/v1/network", s.handleNetwork)                     // network topology: hubs + probes + edges
@@ -318,6 +348,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/services", s.handleServices)                            // my services for ?owner=
 	mux.HandleFunc("POST /api/v1/alerts", s.writeLimit.limit(s.handleAlertRule))        // create or tombstone (signed)
 	mux.HandleFunc("GET /api/v1/alerts", s.handleListAlerts)                            // my alerts for ?owner=
+	mux.HandleFunc("POST /api/v1/maintenance", s.writeLimit.limit(s.handleMaintenance)) // schedule or tombstone (signed)
+	mux.HandleFunc("GET /api/v1/maintenance", s.handleListMaintenance)                  // windows for ?owner= and/or ?check_id=
 	return mux
 }
 
@@ -733,6 +765,140 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, summaries)
 }
 
+// maxCheckIDLen bounds an accepted check_id. Content-derived IDs are 16 hex
+// chars; the cap is generous but stops an unbounded query parameter.
+const maxCheckIDLen = 128
+
+// handleUptime serves a check's sample-weighted uptime percentage over the
+// standard rolling windows (24h/7d/30d) from this hub's local rolled-up history.
+// uptime = (up+degraded)/samples per window (degraded counts as available); a
+// window with no samples is reported unavailable with a null uptime.
+//
+// This is LOCAL-ONLY by design: if the hub does not hold the check's shard, every
+// window is reported unavailable rather than fetched from a holder. Uptime badges
+// and SLO budgets tolerate an unavailable window, and proxying an aggregate uptime
+// figure across the mesh (re-verifying signatures the aggregate has already lost)
+// is out of scope — callers that need a global figure ask a holder directly.
+func (s *Server) handleUptime(w http.ResponseWriter, r *http.Request) {
+	checkID := r.URL.Query().Get("check_id")
+	if checkID == "" || len(checkID) > maxCheckIDLen {
+		http.Error(w, "check_id is required", http.StatusBadRequest)
+		return
+	}
+	// A hub that doesn't hold this check's shard has no local data for it; report
+	// every window unavailable without scanning the store or touching the mesh.
+	if !s.interest.Holds(checkID) {
+		writeJSON(w, http.StatusOK, store.EmptyUptimeReport(checkID))
+		return
+	}
+	// Planned-downtime windows for this check are excluded from the uptime figure.
+	maint, err := s.maint.IntervalsForCheck(r.Context(), checkID)
+	if err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	rep, err := store.ComputeUptime(r.Context(), s.store, checkID, s.now().UnixMilli(), maint)
+	if err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+// handleLatency serves a check's RTT percentiles (p50/p95/p99) plus min/max/count
+// over one rolling window (?window=24h|7d|30d), from this hub's local data. The
+// default window is 24h.
+//
+// A window WITHIN raw retention is computed EXACTLY from raw results (nearest-rank,
+// source "raw"). A window LONGER than raw retention is computed by interpolating
+// the aggregates' latency-bucket histogram (source "histogram"), which survives the
+// full aggregate retention (90d hourly / 730d daily) — so a 30d window stays
+// accurate on a Postgres hub even after raw results age out. The histogram is
+// bucket-interpolated (see store.HistogramPercentiles), so it is accurate-enough
+// rather than exact, softest in a sparse tail.
+//
+// Like handleUptime this is LOCAL-ONLY: a hub that does not hold the check's shard
+// reports the window unavailable rather than fetching from a holder.
+func (s *Server) handleLatency(w http.ResponseWriter, r *http.Request) {
+	checkID := r.URL.Query().Get("check_id")
+	if checkID == "" || len(checkID) > maxCheckIDLen {
+		http.Error(w, "check_id is required", http.StatusBadRequest)
+		return
+	}
+	window := r.URL.Query().Get("window")
+	if window == "" {
+		window = "24h"
+	}
+	span, ok := store.LatencyWindows[window]
+	if !ok {
+		http.Error(w, "window must be one of 24h, 7d, 30d", http.StatusBadRequest)
+		return
+	}
+	// No local data for a shard this hub doesn't hold: report unavailable without
+	// scanning the store or touching the mesh, matching handleUptime.
+	if !s.interest.Holds(checkID) {
+		writeJSON(w, http.StatusOK, store.EmptyLatencyPercentiles(checkID, window))
+		return
+	}
+	now := s.now().UnixMilli()
+	// Within raw retention: exact nearest-rank over raw. Beyond it: interpolate the
+	// aggregates' latency histogram, which survives past raw retention.
+	if span <= s.rawRetMS {
+		rep, err := store.ComputeLatencyPercentiles(r.Context(), s.store, checkID, window, now)
+		if err != nil {
+			http.Error(w, "storage error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, rep)
+		return
+	}
+	summaries, err := s.store.HistoryRange(r.Context(), checkID, now-span, now)
+	if err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, store.HistogramPercentiles(checkID, window, summaries))
+}
+
+// handleIncidents serves a check's outage timeline (?window=24h|7d|30d, default
+// 30d) — a list of past/ongoing incidents DERIVED ON READ from this hub's local
+// rolled-up history. Each incident is a contiguous run of non-up buckets with a
+// start/end, duration, worst status (down|degraded) and bucket count; an incident
+// reaching the window's leading edge is marked ongoing with end = now.
+//
+// Edges are BUCKET-ALIGNED (hourly for ≤14d, daily beyond), reflected in the
+// report's resolution so the UI can caption the granularity. Like handleUptime and
+// handleLatency this is LOCAL-ONLY: a hub that does not hold the check's shard
+// returns an empty report rather than fetching from a holder. Incidents are useful
+// over a longer window, so the default is 30d.
+func (s *Server) handleIncidents(w http.ResponseWriter, r *http.Request) {
+	checkID := r.URL.Query().Get("check_id")
+	if checkID == "" || len(checkID) > maxCheckIDLen {
+		http.Error(w, "check_id is required", http.StatusBadRequest)
+		return
+	}
+	window := r.URL.Query().Get("window")
+	if window == "" {
+		window = "30d"
+	}
+	if _, ok := store.IncidentWindows[window]; !ok {
+		http.Error(w, "window must be one of 24h, 7d, 30d", http.StatusBadRequest)
+		return
+	}
+	// No local data for a shard this hub doesn't hold: report no incidents without
+	// scanning the store or touching the mesh, matching handleUptime/handleLatency.
+	if !s.interest.Holds(checkID) {
+		writeJSON(w, http.StatusOK, store.EmptyIncidentReport(checkID, window))
+		return
+	}
+	rep, err := store.ComputeIncidents(r.Context(), s.store, checkID, window, s.now().UnixMilli())
+	if err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
 // storageHubs is the set of hubs that participate in result placement: this hub
 // plus the live, verified peer hubs from the directory. Peer capacity/archive
 // claims are self-declared, so they pass through shard.HubFrom's trust boundary
@@ -1025,6 +1191,62 @@ func (s *Server) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 		if owner == "" || sa.Rule.Owner == owner {
 			out = append(out, sa.Rule)
 		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleMaintenance accepts an owner-signed maintenance window (or tombstone),
+// stores it, and gossips it. One endpoint handles both schedule and delete: a
+// signed window with Deleted=true removes it. Mirrors handleSubscribe.
+func (s *Server) handleMaintenance(w http.ResponseWriter, r *http.Request) {
+	var sm protocol.SignedMaintenanceWindow
+	if err := json.NewDecoder(r.Body).Decode(&sm); err != nil {
+		http.Error(w, "invalid maintenance window", http.StatusBadRequest)
+		return
+	}
+	if err := sm.Verify(); err != nil {
+		http.Error(w, "maintenance window failed verification: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Bound the free-text reason and reject a non-tombstone with an empty range,
+	// so a signed window carries no unbounded blob and no useless interval.
+	if len(sm.Window.Reason) > protocol.MaxMaintenanceReasonLen {
+		http.Error(w, "reason too long", http.StatusBadRequest)
+		return
+	}
+	if !sm.Window.Deleted && sm.Window.EndMS <= sm.Window.StartMS {
+		http.Error(w, "end_ms must be after start_ms", http.StatusBadRequest)
+		return
+	}
+	if err := s.maint.Upsert(r.Context(), sm); err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.mesh.PublishMaintenance(r.Context(), sm); err != nil {
+		s.log.Warn("gossip maintenance failed", "err", err)
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+// handleListMaintenance returns maintenance windows filtered by ?owner= and/or
+// ?check_id= (either or both). With neither, all active windows are returned.
+func (s *Server) handleListMaintenance(w http.ResponseWriter, r *http.Request) {
+	owner := r.URL.Query().Get("owner")
+	checkID := r.URL.Query().Get("check_id")
+	windows, err := s.maint.ListActive(r.Context())
+	if err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	out := []protocol.MaintenanceWindow{}
+	for _, sm := range windows {
+		if owner != "" && sm.Window.Owner != owner {
+			continue
+		}
+		if checkID != "" && sm.Window.CheckID != checkID {
+			continue
+		}
+		out = append(out, sm.Window)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

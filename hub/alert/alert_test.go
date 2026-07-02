@@ -90,6 +90,13 @@ func upResult(check, probe string, ts int64) protocol.SignedResult {
 
 // engineFixture wires an engine whose single recipient is itself.
 func engineFixture(t *testing.T, notifier Notifier) (*Engine, *store.MemAlerts, *store.MemStore, protocol.AlertRule) {
+	eng, alerts, results, _, rule := engineFixtureMaint(t, notifier)
+	return eng, alerts, results, rule
+}
+
+// engineFixtureMaint is engineFixture plus the maintenance store, for tests that
+// need to schedule planned-downtime windows.
+func engineFixtureMaint(t *testing.T, notifier Notifier) (*Engine, *store.MemAlerts, *store.MemStore, *store.MemMaintenance, protocol.AlertRule) {
 	t.Helper()
 	hubID, _ := identity.Generate()
 	enc := encbox.FromSeed(hubID.Seed())
@@ -103,13 +110,14 @@ func engineFixture(t *testing.T, notifier Notifier) (*Engine, *store.MemAlerts, 
 	}
 	alerts := store.NewMemAlerts()
 	results := store.NewMemStore()
+	maint := store.NewMemMaintenance()
 	_ = alerts.Upsert(context.Background(), protocol.SignedAlertRule{Rule: rule})
 
-	eng := NewEngine(hubID, alerts, results, func() []string { return nil }, enc.Open,
+	eng := NewEngine(hubID, alerts, results, maint, func() []string { return nil }, enc.Open,
 		func(context.Context, protocol.SignedDeliveryState) {},
 		map[protocol.AlertChannel]Notifier{protocol.AlertWebhook: notifier}, nil)
 	eng.now = func() time.Time { return time.UnixMilli(testNowMS) }
-	return eng, alerts, results, rule
+	return eng, alerts, results, maint, rule
 }
 
 // losingPeer returns a hub ID that loses the rendezvous for key to self, so that
@@ -148,9 +156,10 @@ func twoRecipientFixture(t *testing.T, notifier Notifier) (*Engine, *store.MemAl
 
 	alerts := store.NewMemAlerts()
 	results := store.NewMemStore()
+	maint := store.NewMemMaintenance()
 	_ = alerts.Upsert(context.Background(), protocol.SignedAlertRule{Rule: rule})
 
-	eng := NewEngine(hubID, alerts, results, func() []string { return []string{peer} }, enc.Open,
+	eng := NewEngine(hubID, alerts, results, maint, func() []string { return []string{peer} }, enc.Open,
 		func(context.Context, protocol.SignedDeliveryState) {},
 		map[protocol.AlertChannel]Notifier{protocol.AlertWebhook: notifier}, nil)
 	eng.now = func() time.Time { return time.UnixMilli(testNowMS) }
@@ -316,6 +325,46 @@ func TestDeliveryStateFromNonRecipientIgnored(t *testing.T) {
 	eng.Evaluate(ctx)
 	if nf.count() != 1 {
 		t.Fatalf("non-recipient state must not suppress; expected 1 delivery, got %d", nf.count())
+	}
+}
+
+// TestMaintenanceSuppressesDownThenAlertsAfter proves a planned-downtime window
+// suppresses the DOWN alert while active (without advancing delivered state), and
+// that once the window ends a still-down service alerts normally.
+func TestMaintenanceSuppressesDownThenAlertsAfter(t *testing.T) {
+	ctx := context.Background()
+	nf := &flakyNotifier{}
+	eng, _, results, maint, rule := engineFixtureMaint(t, nf)
+
+	// Pin the engine clock so the window can bracket "now".
+	fixedNow := int64(1_000_000)
+	eng.now = func() time.Time { return time.UnixMilli(fixedNow) }
+
+	_ = results.Insert(ctx, downResult("chk", "pa", fixedNow-100))
+	_ = results.Insert(ctx, downResult("chk", "pb", fixedNow-100))
+
+	// Schedule a window covering "now".
+	owner, _ := identity.Generate()
+	_ = maint.Upsert(ctx, protocol.SignMaintenanceWindow(owner, protocol.MaintenanceWindow{
+		CheckID: rule.CheckID, StartMS: fixedNow - 500, EndMS: fixedNow + 500, UpdatedMS: 1,
+	}))
+
+	// Inside the window: the down must be suppressed and delivered state untouched.
+	eng.Evaluate(ctx)
+	if nf.count() != 0 {
+		t.Fatalf("maintenance must suppress the down alert, got %d deliveries", nf.count())
+	}
+	if s := eng.deliveredStatus(ctx, rule); s != protocol.StatusUp {
+		t.Fatalf("suppressed down must not advance delivered state, got %q", s)
+	}
+
+	// After the window ends, the still-down service must alert.
+	eng.now = func() time.Time { return time.UnixMilli(fixedNow + 1000) }
+	_ = results.Insert(ctx, downResult("chk", "pa", fixedNow+900))
+	_ = results.Insert(ctx, downResult("chk", "pb", fixedNow+900))
+	eng.Evaluate(ctx)
+	if nf.count() != 1 || nf.n[0].Status != protocol.StatusDown {
+		t.Fatalf("after the window a still-down service must alert, got %d", nf.count())
 	}
 }
 

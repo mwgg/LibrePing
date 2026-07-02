@@ -66,23 +66,30 @@ function bucketFill(b: Bucket): string {
   );
 }
 
-// useHistory loads + merges a check's history once.
-function useHistory(checkId: string): { buckets: Bucket[] | null; resolution: string } {
+// useHistory loads + merges a check's history once. When `preRows` is supplied
+// (the caller already fetched the same history — e.g. CheckDetail, which shares
+// one fetch with the per-region breakdown) it folds those instead of issuing a
+// second request; `undefined` means "fetch it yourself" and `null` means
+// "still loading upstream".
+function useHistory(checkId: string, preRows?: HistorySummary[] | null): { buckets: Bucket[] | null; resolution: string } {
   const [rows, setRows] = useState<HistorySummary[] | null>(null);
+  const supplied = preRows !== undefined;
   useEffect(() => {
+    if (supplied) return;
     let live = true;
     setRows(null);
     history(checkId).then((r) => live && setRows(r));
     return () => {
       live = false;
     };
-  }, [checkId]);
-  if (rows === null) return { buckets: null, resolution: "" };
-  return { buckets: mergeBuckets(rows), resolution: rows[0]?.resolution ?? "" };
+  }, [checkId, supplied]);
+  const effective = supplied ? preRows! : rows;
+  if (effective === null) return { buckets: null, resolution: "" };
+  return { buckets: mergeBuckets(effective), resolution: effective[0]?.resolution ?? "" };
 }
 
-export default function History({ checkId }: { checkId: string }) {
-  const { buckets, resolution } = useHistory(checkId);
+export default function History({ checkId, rows }: { checkId: string; rows?: HistorySummary[] | null }) {
+  const { buckets, resolution } = useHistory(checkId, rows);
 
   if (buckets === null)
     return (

@@ -73,6 +73,23 @@ func TestHistoryRangeBuckets(t *testing.T) {
 	if h.LastStatus != "down" || h.Resolution != "hourly" {
 		t.Fatalf("bad stats: %+v", h)
 	}
+	// Measured count and latency buckets exclude the down rows: the two up samples
+	// (10, 30) are both <= 50, so every le_<bound> from 50ms up counts 2; le_25
+	// counts only the 10ms sample; le_5 counts none. le_10000 must equal rtt_samples
+	// (no overflow), so overflow = rtt_samples - le_10000 = 0.
+	if h.RTTSamples != 2 {
+		t.Fatalf("rtt_samples should be 2 measured, got %d", h.RTTSamples)
+	}
+	wantBuckets := map[int64]int64{5: 0, 10: 1, 25: 1, 50: 2, 100: 2, 10000: 2}
+	for i, bound := range RttBucketBoundsMS {
+		if want, ok := wantBuckets[bound]; ok && h.RttBuckets[i] != want {
+			t.Fatalf("le_%d: got %d, want %d", bound, h.RttBuckets[i], want)
+		}
+	}
+	if h.RttBuckets[numRttBuckets-1] != h.RTTSamples {
+		t.Fatalf("le_10000 (%d) must equal rtt_samples (%d): no overflow expected",
+			h.RttBuckets[numRttBuckets-1], h.RTTSamples)
+	}
 }
 
 // TestMemStoreEvictsOldestAndReclaimsSeen proves the unbounded-growth fix: past

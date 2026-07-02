@@ -103,7 +103,7 @@ func main() {
 	// destinations sealed to this hub.
 	enc := encbox.FromSeed(id.Seed())
 
-	resultStore, catalogStore, subStore, alertStore := openStores(ctx, log)
+	resultStore, catalogStore, subStore, alertStore, maintStore := openStores(ctx, log)
 	defer resultStore.Close()
 
 	policy := trust.FromConfig(os.Getenv("TRUST_POLICY"), splitCSV(os.Getenv("TRUST_ALLOWLIST")))
@@ -140,6 +140,7 @@ func main() {
 		CatalogSnapshot:      catalogStore.ListChecks,
 		SubscriptionSnapshot: subStore.ListForGossip,
 		AlertSnapshot:        alertStore.ListForGossip,
+		MaintenanceSnapshot:  maintStore.ListForGossip,
 		Policy:               policy,
 		Logger:               log,
 		Ingest: func(ctx context.Context, sr protocol.SignedResult) {
@@ -190,6 +191,11 @@ func main() {
 		IngestAlert: func(ctx context.Context, sa protocol.SignedAlertRule) {
 			if err := alertStore.Upsert(ctx, sa); err != nil {
 				log.Warn("store gossiped alert", "err", err)
+			}
+		},
+		IngestMaintenance: func(ctx context.Context, sm protocol.SignedMaintenanceWindow) {
+			if err := maintStore.Upsert(ctx, sm); err != nil {
+				log.Warn("store gossiped maintenance window", "err", err)
 			}
 		},
 		IngestDelivery: func(ctx context.Context, sd protocol.SignedDeliveryState) {
@@ -258,6 +264,7 @@ func main() {
 		Catalog:           catalogStore,
 		Subscriptions:     subStore,
 		Alerts:            alertStore,
+		Maintenance:       maintStore,
 		Mesh:              mesh,
 		Identity:          id,
 		EncPubKey:         enc.PublicKey(),
@@ -277,6 +284,7 @@ func main() {
 		SelfHub:           selfHub,
 		AllowPrivatePeers: allowPrivatePeers,
 		Outbox:            ob,
+		RawRetentionDays:  atoiDefault(os.Getenv("RESULT_RETENTION_DAYS"), store.DefaultTierConfig().RawRetentionDays),
 		Logger:            log,
 	})
 
@@ -353,14 +361,14 @@ func main() {
 	// Background gossip: re-announce known checks (anti-entropy so new hubs
 	// converge) and advertise this hub if enabled. Intervals govern how fast a
 	// newly-joined hub converges on the catalog/directory.
-	go gossipLoop(ctx, log, id, resultStore, catalogStore, subStore, alertStore, mesh, ob, srv.PushToHolders, durDefault(os.Getenv("CATALOG_GOSSIP_INTERVAL"), time.Minute))
+	go gossipLoop(ctx, log, id, resultStore, catalogStore, subStore, alertStore, maintStore, mesh, ob, srv.PushToHolders, durDefault(os.Getenv("CATALOG_GOSSIP_INTERVAL"), time.Minute))
 	go advertiseLoop(ctx, log, id, enc.PublicKey(), selfHub, mesh, selfName, selfURL, selfLoc, durDefault(os.Getenv("ADVERTISE_INTERVAL"), time.Minute))
 
 	// Alert engine: this hub fires only the rules rendezvous-hashing assigns to
 	// it among the recipient hubs that are currently live. A short liveness
 	// window means a dead responsible hub ages out quickly and a peer takes over.
 	hubTTL := durDefault(os.Getenv("ALERT_HUB_TTL"), 3*time.Minute)
-	engine := alert.NewEngine(id, alertStore, resultStore,
+	engine := alert.NewEngine(id, alertStore, resultStore, maintStore,
 		func() []string {
 			hubs := dir.ActiveWithin(hubTTL)
 			ids := make([]string, 0, len(hubs))
@@ -431,11 +439,11 @@ func connectWithRetry(ctx context.Context, log *slog.Logger, dsn string, timeout
 // openStores returns result + catalog stores. With DATABASE_URL set both are
 // Postgres-backed (migrations run first); otherwise both are in-memory so the
 // hub can run with zero dependencies for local trials.
-func openStores(ctx context.Context, log *slog.Logger) (store.ResultStore, store.CatalogStore, store.SubscriptionStore, store.AlertStore) {
+func openStores(ctx context.Context, log *slog.Logger) (store.ResultStore, store.CatalogStore, store.SubscriptionStore, store.AlertStore, store.MaintenanceStore) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		log.Warn("DATABASE_URL not set; using in-memory stores (data is not persisted)")
-		return store.NewMemStore(), store.NewMemCatalog(), store.NewMemSubscriptions(), store.NewMemAlerts()
+		return store.NewMemStore(), store.NewMemCatalog(), store.NewMemSubscriptions(), store.NewMemAlerts(), store.NewMemMaintenance()
 	}
 	// Wait for the database instead of exiting on the first failure: on a fresh
 	// volume TimescaleDB runs its init then restarts, so a hub started by
@@ -476,7 +484,7 @@ func openStores(ctx context.Context, log *slog.Logger) (store.ResultStore, store
 		log.Info("result storage tiers configured", "raw_days", tier.RawRetentionDays,
 			"hourly_days", tier.HourlyRetentionDays, "daily_days", tier.DailyRetentionDays)
 	}
-	return pg, store.NewPgCatalog(pg), store.NewPgSubscriptions(pg), store.NewPgAlerts(pg)
+	return pg, store.NewPgCatalog(pg), store.NewPgSubscriptions(pg), store.NewPgAlerts(pg), store.NewPgMaintenance(pg)
 }
 
 // seedCheck optionally creates one HTTP check on boot, signed by this hub and
@@ -510,12 +518,13 @@ func seedCheck(ctx context.Context, log *slog.Logger, id *identity.Identity, cat
 }
 
 // gossipLoop periodically re-broadcasts this hub's catalog, subscriptions,
-// alert rules, and its own alert delivery states (anti-entropy) so newly-joined
+// maintenance windows, alert rules, and its own alert delivery states
+// (anti-entropy) so newly-joined
 // or previously-disconnected hubs converge on the full picture. Re-broadcasting
 // delivery state is what makes failover deduplication reliable: a peer that
 // missed the one-shot publish at delivery time still learns what was already
 // notified before it might become responsible.
-func gossipLoop(ctx context.Context, log *slog.Logger, id *identity.Identity, results store.ResultStore, catalog store.CatalogStore, subs store.SubscriptionStore, alerts store.AlertStore, mesh *p2p.Node, ob *outbox.Outbox, pushToHolders func(protocol.SignedResult), every time.Duration) {
+func gossipLoop(ctx context.Context, log *slog.Logger, id *identity.Identity, results store.ResultStore, catalog store.CatalogStore, subs store.SubscriptionStore, alerts store.AlertStore, maint store.MaintenanceStore, mesh *p2p.Node, ob *outbox.Outbox, pushToHolders func(protocol.SignedResult), every time.Duration) {
 	self := id.NodeID()
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
@@ -551,6 +560,11 @@ func gossipLoop(ctx context.Context, log *slog.Logger, id *identity.Identity, re
 			if subList, err := subs.ListForGossip(ctx); err == nil {
 				for _, ss := range subList {
 					_ = mesh.PublishSubscription(ctx, ss)
+				}
+			}
+			if mwList, err := maint.ListForGossip(ctx); err == nil {
+				for _, sm := range mwList {
+					_ = mesh.PublishMaintenance(ctx, sm)
 				}
 			}
 			if ruleList, err := alerts.ListForGossip(ctx); err == nil {

@@ -178,6 +178,7 @@ const (
 	GossipSubscription GossipKind = "subscription"
 	GossipAlert        GossipKind = "alert"
 	GossipDelivery     GossipKind = "delivery"
+	GossipMaintenance  GossipKind = "maintenance"
 )
 
 // CatalogEntry announces a check that exists on the network. It is signed by
@@ -351,11 +352,12 @@ func (sd SignedDeliveryState) Verify() error {
 // GossipEnvelope is the message format published on the mesh. Exactly one of
 // the payload pointers is set, matching Kind.
 type GossipEnvelope struct {
-	Kind         GossipKind             `json:"kind"`
-	Result       *SignedResult          `json:"result,omitempty"`
-	Catalog      *SignedCatalogEntry    `json:"catalog,omitempty"`
-	Hub          *SignedHubAnnouncement `json:"hub,omitempty"`
-	Subscription *SignedSubscription    `json:"subscription,omitempty"`
-	Alert        *SignedAlertRule       `json:"alert,omitempty"`
-	Delivery     *SignedDeliveryState   `json:"delivery,omitempty"`
+	Kind         GossipKind               `json:"kind"`
+	Result       *SignedResult            `json:"result,omitempty"`
+	Catalog      *SignedCatalogEntry      `json:"catalog,omitempty"`
+	Hub          *SignedHubAnnouncement   `json:"hub,omitempty"`
+	Subscription *SignedSubscription      `json:"subscription,omitempty"`
+	Alert        *SignedAlertRule         `json:"alert,omitempty"`
+	Delivery     *SignedDeliveryState     `json:"delivery,omitempty"`
+	Maintenance  *SignedMaintenanceWindow `json:"maintenance,omitempty"`
 }

@@ -85,6 +85,20 @@ func refreshLookbackDays(retentionDays int) int {
 
 const dayMS = int64(86_400_000)
 
+// Latency percentiles over longer-than-raw windows are served from fixed
+// latency-bucket counts (le_<bound>) carried on both continuous aggregates, NOT a
+// tdigest/approx_percentile column: those come from the timescaledb_toolkit
+// extension, which the pinned plain TimescaleDB image (timescale/timescaledb, see
+// docker-compose*.yml) does NOT bundle — the toolkit ships only in the
+// timescaledb-ha images, and an aggregate depending on a missing extension would
+// break ConfigureResultTiers (and thus hub startup). The le_<bound> columns are
+// ordinary decomposable count aggregates (no extension), so they roll up
+// hierarchically (daily = sum of hourly) and survive raw retention. The endpoint
+// (GET /api/v1/latency, hub/store/latency.go) interpolates percentiles from the
+// summed cumulative histogram for windows longer than raw retention, and uses
+// exact RAW results within it. The trade-off is bucket-interpolation accuracy
+// (soft in a sparse tail), acceptable versus needing the toolkit image.
+
 // ConfigureResultTiers sets up compression + downsampling on the results
 // hypertable: native columnar compression, two hierarchical continuous
 // aggregates (hourly→daily), and retention policies per tier. It is idempotent
@@ -118,22 +132,25 @@ func (s *PgStore) ConfigureResultTiers(ctx context.Context, cfg TierConfig) erro
 // migrateResultAggregates drops the result rollups when they exist in an older
 // shape, so tierStatements' CREATE ... IF NOT EXISTS recreates them with the
 // current definition. The continuous aggregates are created IF NOT EXISTS, so a
-// changed SELECT — here, excluding timed-out samples from the RTT stats — would
-// otherwise never take effect on a hub that already ran an earlier version.
+// changed SELECT would otherwise never take effect on a hub that already ran an
+// earlier version. This is the versioned-rebuild mechanism: to change an
+// aggregate's shape, bump the marker column below and add the new columns to the
+// CREATE statements.
 //
-// Detection: the current definition adds an rtt_samples column; its absence on an
-// existing results_hourly marks the old shape. Dropping hourly CASCADE also drops
-// the dependent daily aggregate (and their policies); both are rebuilt and
-// re-materialized from raw by the CREATE + refresh steps that follow. This runs
-// at most once — after the rebuild the column is present, so later restarts skip
-// it (no per-restart data loss).
+// Detection: the current definition adds the latency-bucket columns (marker:
+// le_10000); its absence on an existing results_hourly marks an older shape.
+// (The previous marker was rtt_samples; le_10000 supersedes it.) Dropping hourly
+// CASCADE also drops the dependent daily aggregate (and their policies); both are
+// rebuilt and re-materialized from raw by the CREATE + refresh steps that follow.
+// This runs at most once — after the rebuild the column is present, so later
+// restarts skip it (no per-restart data loss).
 func (s *PgStore) migrateResultAggregates(ctx context.Context) error {
 	var exists, current bool
 	if err := s.pool.QueryRow(ctx, `
 		SELECT
 		  to_regclass('results_hourly') IS NOT NULL,
 		  EXISTS (SELECT 1 FROM information_schema.columns
-		          WHERE table_name = 'results_hourly' AND column_name = 'rtt_samples')`,
+		          WHERE table_name = 'results_hourly' AND column_name = 'le_10000')`,
 	).Scan(&exists, &current); err != nil {
 		return fmt.Errorf("inspect result aggregates: %w", err)
 	}
@@ -184,6 +201,14 @@ func tierStatements(cfg TierConfig) []string {
 		   avg(rtt_ms) FILTER (WHERE status <> 'down' AND rtt_ms > 0) AS rtt_avg,
 		   min(rtt_ms) FILTER (WHERE status <> 'down' AND rtt_ms > 0) AS rtt_min,
 		   max(rtt_ms) FILTER (WHERE status <> 'down' AND rtt_ms > 0) AS rtt_max,
+		   -- Fixed latency-bucket cumulative counts (le_<bound>: measured samples
+		   -- with rtt_ms <= bound), over the SAME measured set as rtt_samples. These
+		   -- are ordinary decomposable count aggregates, so a continuous aggregate
+		   -- can hold them and the daily rollup sums them; percentiles are then
+		   -- interpolated from the summed histogram over windows longer than raw
+		   -- retention (see hub/store/latency.go HistogramPercentiles). le_10000 is
+		   -- also the schema marker migrateResultAggregates uses to rebuild.
+		   ` + hourlyBucketColumns() + `
 		   last(status, timestamp_ms)     AS last_status,
 		   last(check_type, timestamp_ms) AS check_type,
 		   last(target, timestamp_ms)     AS target,
@@ -213,6 +238,9 @@ func tierStatements(cfg TierConfig) []string {
 		   sum(rtt_samples) AS rtt_samples,
 		   sum(rtt_avg * rtt_samples) / nullif(sum(rtt_samples), 0) AS rtt_avg,
 		   min(rtt_min) AS rtt_min, max(rtt_max) AS rtt_max,
+		   -- Roll the hourly latency buckets up hierarchically: a cumulative count is
+		   -- decomposable, so summing the hourly le_<bound> yields the day's le_<bound>.
+		   ` + dailyBucketColumns() + `
 		   last(last_status, bucket) AS last_status,
 		   last(check_type, bucket)  AS check_type,
 		   last(target, bucket)      AS target,
@@ -301,4 +329,27 @@ func tierStatements(cfg TierConfig) []string {
 // computed in Go (int64) so it can't overflow int4 during SQL evaluation.
 func ms(days int) string {
 	return fmt.Sprintf("%d::BIGINT", int64(days)*dayMS)
+}
+
+// hourlyBucketColumns builds the le_<bound> aggregate columns for results_hourly:
+// one cumulative COUNT per boundary in RttBucketBoundsMS, filtered to the same
+// measured set as rtt_samples (successful, non-zero rtt). Emitted as a comma-
+// terminated fragment slotted into the CREATE MATERIALIZED VIEW SELECT.
+func hourlyBucketColumns() string {
+	var b strings.Builder
+	for _, bound := range RttBucketBoundsMS {
+		fmt.Fprintf(&b, "count(*) FILTER (WHERE status <> 'down' AND rtt_ms > 0 AND rtt_ms <= %d) AS le_%d,\n\t\t\t   ", bound, bound)
+	}
+	return b.String()
+}
+
+// dailyBucketColumns builds the hierarchical rollup of the hourly le_<bound>
+// columns: sum(le_<bound>) AS le_<bound>. A cumulative count is decomposable, so
+// the day's histogram is the sum of its hours'.
+func dailyBucketColumns() string {
+	var b strings.Builder
+	for _, bound := range RttBucketBoundsMS {
+		fmt.Fprintf(&b, "sum(le_%d) AS le_%d,\n\t\t\t   ", bound, bound)
+	}
+	return b.String()
 }

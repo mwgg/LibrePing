@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { Identity } from "./identity";
 import { Service, LocationStatus, listServices, unsubscribe, renewLeases, forgetStoredAlerts } from "./api";
-import { fmtRtt, latencyStats, relativeTime, statusColor } from "./theme";
+import { fmtRtt, fmtUptime, latencyStats, relativeTime, statusColor, uptimeColor } from "./theme";
 import AddMonitor from "./AddMonitor";
 import { Sparkline } from "./History";
 import StatusBadge from "./Badge";
 import Alerts from "./Alerts";
 import AlertForm from "./AlertForm";
-import CheckDetail from "./CheckDetail";
+import CheckDetail, { useUptime } from "./CheckDetail";
 import ServiceMap from "./ServiceMap";
 
 // Services is the "my services" dashboard for a given owner. When `editable`
@@ -195,6 +195,13 @@ function ServiceCard({
   const [mapOpen, setMapOpen] = useState(false);
   const m = summarize(svc.locations);
   const lat = latencyStats(svc.locations);
+  // Headline availability for the card: the 30d window. The full 24h/7d/30d
+  // breakdown lives on the detail view. Fetched lazily (its own request), so it
+  // never blocks or delays the card render.
+  const uptimeReport = useUptime(svc.check_id);
+  const uptime30d = uptimeReport?.windows["30d"];
+  const uptimeColorStyle =
+    uptime30d && uptime30d.available && uptime30d.uptime !== null ? { color: uptimeColor(uptime30d.uptime) } : undefined;
   const countries = aggregateByCountry(svc.locations);
   const shownCountries = countries.slice(0, maxCountryTags);
   const extraCountries = countries.length - shownCountries.length;
@@ -251,6 +258,12 @@ function ServiceCard({
         <div className="metric">
           <span className="metric-label">p95</span>
           <span className="metric-value">{lat.p95 === null ? "—" : fmtRtt(lat.p95)}</span>
+        </div>
+        <div className="metric">
+          <span className="metric-label">Uptime 30d</span>
+          <span className="metric-value" style={uptimeColorStyle} title="Sample-weighted availability over 30 days (see the detail view for 24h/7d)">
+            {uptimeReport === null ? "…" : fmtUptime(uptime30d)}
+          </span>
         </div>
         <div className="metric">
           <span className="metric-label">Last check</span>
