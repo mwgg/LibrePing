@@ -478,12 +478,22 @@ func openStores(ctx context.Context, log *slog.Logger) (store.ResultStore, store
 	for _, warn := range tierWarnings {
 		log.Warn("result storage retention adjusted", "reason", warn)
 	}
-	if err := pg.ConfigureResultTiers(ctx, tier); err != nil {
-		log.Error("configure result storage tiers (continuing without full tiering)", "err", err)
-	} else {
+	// Configure tiers in the background so the hub starts serving immediately.
+	// ConfigureResultTiers can be slow the first time an aggregate's shape changes:
+	// it drops and re-materializes the hourly/daily continuous aggregates, which on
+	// a hub with history is a multi-minute scan. Blocking startup on it would 502
+	// every request until it finished. It is already best-effort (failure is
+	// non-fatal), and the core read paths (services, locations, recent results) use
+	// the raw table, not the aggregates — only history/uptime/latency/incidents are
+	// briefly degraded while the rollups rebuild, then recover on their own.
+	go func() {
+		if err := pg.ConfigureResultTiers(ctx, tier); err != nil {
+			log.Error("configure result storage tiers (continuing without full tiering)", "err", err)
+			return
+		}
 		log.Info("result storage tiers configured", "raw_days", tier.RawRetentionDays,
 			"hourly_days", tier.HourlyRetentionDays, "daily_days", tier.DailyRetentionDays)
-	}
+	}()
 	return pg, store.NewPgCatalog(pg), store.NewPgSubscriptions(pg), store.NewPgAlerts(pg), store.NewPgMaintenance(pg)
 }
 
