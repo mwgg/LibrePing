@@ -81,3 +81,23 @@ func TestAssignIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPConnectRequiresExplicitCapability(t *testing.T) {
+	probes := []Probe{{ID: "legacy"}, {ID: "old", SupportedTypes: map[protocol.CheckType]bool{protocol.CheckHTTP: true}}}
+	for _, id := range []string{"new1", "new2", "new3"} {
+		probes = append(probes, Probe{ID: id, SupportedTypes: map[protocol.CheckType]bool{protocol.CheckHTTPConnect: true}})
+	}
+	got := Assign([]protocol.CheckSpec{{ID: "pinned", Type: protocol.CheckHTTPConnect}}, probes, 3)
+	for _, p := range probes {
+		want := 1
+		if p.ID == "legacy" || p.ID == "old" {
+			want = 0
+		}
+		if len(got[p.ID]) != want {
+			t.Fatalf("%s: %v", p.ID, got[p.ID])
+		}
+	}
+	if len(Assign([]protocol.CheckSpec{httpCheck("normal", 60)}, probes[:1], 1)["legacy"]) != 1 {
+		t.Fatal("legacy HTTP changed")
+	}
+}

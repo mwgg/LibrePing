@@ -433,6 +433,23 @@ hub-operator configuration** — there is nothing to set up to enable them.
 | `CATALOG_GOSSIP_INTERVAL` | `1m` | Anti-entropy re-broadcast interval for catalog/subscriptions/alerts. |
 | `INTEREST_INTERVAL` | `30s` | How often the hub recomputes which shards it should hold. |
 
+### Pinned HTTP rollout
+
+`http_connect` checks connect directly to `params.connect_address` while using
+an HTTP(S) URL for Host, SNI and verified TLS identity. The backend IP must pass
+`PROBE_BLOCK_PRIVATE` / `PROBE_ALLOW_TARGETS`; refusal produces a down result
+with a policy error. Redirects are not followed. See the README check-type
+contract and API example.
+
+Upgrade hubs and enough probes for the required redundancy before depending on
+this type. New probes advertise it automatically unless disabled with
+`DISABLE_CHECKS=http_connect`. New hubs require that explicit capability even
+from legacy probes with empty supported-type lists. Old probes skip unknown
+types without results; old hubs may assign them to undeclared legacy probes.
+Confirm registration, assignment and fresh results at the intended locations;
+a successful catalog POST alone is not a readiness check. Preserve probe key
+volumes during upgrades so identities and existing settings remain stable.
+
 ### Probe
 
 | Variable | Default | Purpose |

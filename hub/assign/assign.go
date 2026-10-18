@@ -20,8 +20,11 @@ type Probe struct {
 }
 
 // supports reports whether the probe can run the given check type. A probe with
-// no declared types is treated as supporting all (backward-compatible default).
+// no declared types supports historical types, but must opt in to http_connect.
 func (p Probe) supports(t protocol.CheckType) bool {
+	if t == protocol.CheckHTTPConnect {
+		return p.SupportedTypes[t]
+	}
 	if len(p.SupportedTypes) == 0 {
 		return true
 	}

@@ -27,12 +27,13 @@ import (
 type CheckType string
 
 const (
-	CheckHTTP       CheckType = "http"       // HTTP(S) status, latency, keyword match — no privilege
-	CheckTCP        CheckType = "tcp"        // TCP connect reachability + latency — no privilege
-	CheckDNS        CheckType = "dns"        // DNS resolution + expected answer — no privilege
-	CheckTLS        CheckType = "tls"        // TLS certificate expiry/chain — no privilege
-	CheckICMP       CheckType = "icmp"       // ICMP ping — REQUIRES raw sockets (NET_RAW / ping_group_range)
-	CheckTraceroute CheckType = "traceroute" // path + per-hop latency — REQUIRES raw sockets (NET_RAW)
+	CheckHTTPConnect CheckType = "http_connect" // HTTP(S) pinned to a literal backend IP
+	CheckHTTP        CheckType = "http"         // HTTP(S) status, latency, keyword match — no privilege
+	CheckTCP         CheckType = "tcp"          // TCP connect reachability + latency — no privilege
+	CheckDNS         CheckType = "dns"          // DNS resolution + expected answer — no privilege
+	CheckTLS         CheckType = "tls"          // TLS certificate expiry/chain — no privilege
+	CheckICMP        CheckType = "icmp"         // ICMP ping — REQUIRES raw sockets (NET_RAW / ping_group_range)
+	CheckTraceroute  CheckType = "traceroute"   // path + per-hop latency — REQUIRES raw sockets (NET_RAW)
 )
 
 // Status is the outcome of a check.

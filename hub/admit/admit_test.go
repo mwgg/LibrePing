@@ -143,3 +143,16 @@ func TestResultCatalogMismatch(t *testing.T) {
 		t.Fatalf("matching result rejected: %v", err)
 	}
 }
+
+func TestHTTPConnectSpecAdmission(t *testing.T) {
+	for _, kind := range []protocol.CheckType{protocol.CheckHTTP, protocol.CheckHTTPConnect} {
+		s := protocol.CheckSpec{Type: kind, Target: "https://example.com", Params: map[string]string{"connect_address": "not-an-ip"}}
+		if err := Spec(s); (err != nil) != (kind == protocol.CheckHTTPConnect) {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		s.Params["connect_address"] = "2001:db8::1"
+		if err := Spec(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

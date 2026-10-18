@@ -41,6 +41,7 @@ type Registry struct {
 func NewRegistry() *Registry {
 	r := &Registry{checkers: map[protocol.CheckType]Checker{}}
 	r.Register(HTTPChecker{})
+	r.Register(HTTPConnectChecker{})
 	r.Register(TCPChecker{})
 	r.Register(DNSChecker{})
 	r.Register(TLSChecker{})

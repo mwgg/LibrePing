@@ -836,3 +836,39 @@ func subscribe(t *testing.T, srv *Server, owner *identity.Identity, checkID stri
 		t.Fatalf("subscribe: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestHTTPConnectCreationAndMixedRegistration(t *testing.T) {
+	hubID, _ := identity.Generate()
+	srv := New(Config{Store: store.NewMemStore(), Identity: hubID, Redundancy: 3})
+	bad := do(srv, http.MethodPost, "/api/v1/checks", map[string]any{"type": "http_connect", "target": "https://example.com"})
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("missing address accepted: %d", bad.Code)
+	}
+	created := do(srv, http.MethodPost, "/api/v1/checks", map[string]any{"type": "http_connect", "target": "https://example.com", "params": map[string]string{"connect_address": "192.0.2.1"}})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", created.Code, created.Body.String())
+	}
+	var spec protocol.CheckSpec
+	json.Unmarshal(created.Body.Bytes(), &spec)
+	owner, _ := identity.Generate()
+	subscribe(t, srv, owner, spec.ID, 60)
+	for _, types := range [][]protocol.CheckType{nil, {protocol.CheckHTTP}, {protocol.CheckHTTPConnect, protocol.CheckType("future_check")}} {
+		probe, _ := identity.Generate()
+		reg, _ := protocol.SignProbeRegistration(probe, protocol.ProbeRegistration{SupportedTypes: types, MaxChecksPerMinute: 60, TimestampMS: time.Now().UnixMilli()})
+		resp := do(srv, http.MethodPost, "/api/v1/probes/register", reg)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("registration: %d %s", resp.Code, resp.Body.String())
+		}
+		want := 0
+		if len(types) == 2 {
+			want = 1
+		}
+		if got := assignedTo(srv, probe.NodeID()); len(got) != want {
+			t.Fatalf("%v assigned %v", types, got)
+		}
+	}
+	legacy := do(srv, http.MethodPost, "/api/v1/checks", map[string]any{"type": "http", "target": "https://example.com", "params": map[string]string{"connect_address": "ignored"}})
+	if legacy.Code != http.StatusCreated {
+		t.Fatalf("legacy spec rejected: %d", legacy.Code)
+	}
+}

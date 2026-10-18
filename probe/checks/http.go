@@ -2,6 +2,8 @@ package checks
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -26,7 +28,25 @@ type HTTPChecker struct{}
 
 func (HTTPChecker) Type() protocol.CheckType { return protocol.CheckHTTP }
 
+// HTTPConnectChecker measures a URL through a specific backend without changing
+// its HTTP Host, TLS SNI or certificate identity. Nil roots use system trust.
+type HTTPConnectChecker struct{ roots *x509.CertPool }
+
+func (HTTPConnectChecker) Type() protocol.CheckType { return protocol.CheckHTTPConnect }
+
+func (c HTTPConnectChecker) Run(ctx context.Context, spec protocol.CheckSpec) (Outcome, error) {
+	spec.Type = protocol.CheckHTTPConnect
+	if err := spec.ValidateHTTPConnect(); err != nil {
+		return Outcome{Status: protocol.StatusDown, Detail: map[string]string{"error": err.Error()}}, nil
+	}
+	return runHTTP(ctx, spec, true, c.roots)
+}
+
 func (HTTPChecker) Run(ctx context.Context, spec protocol.CheckSpec) (Outcome, error) {
+	return runHTTP(ctx, spec, false, nil)
+}
+
+func runHTTP(ctx context.Context, spec protocol.CheckSpec, pinned bool, roots *x509.CertPool) (Outcome, error) {
 	timeout := 10 * time.Second
 	if v := spec.Params["timeout_seconds"]; v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -50,14 +70,24 @@ func (HTTPChecker) Run(ctx context.Context, spec protocol.CheckSpec) (Outcome, e
 	// A fresh client per run avoids connection reuse skewing latency between
 	// independent checks. The dialer enforces the target policy (and re-checks
 	// every redirect hop), so a check cannot be used to reach internal hosts.
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			Proxy: nil,
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return guardDial(ctx, network, addr, timeout)
-			},
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if pinned {
+				_, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				addr = net.JoinHostPort(spec.Params["connect_address"], port)
+			}
+			return guardDial(ctx, network, addr, timeout)
 		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: timeout, Transport: transport}
+	if pinned {
+		transport.TLSClientConfig = &tls.Config{RootCAs: roots}
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	}
 
 	start := time.Now()

@@ -8,6 +8,7 @@ import (
 
 	"github.com/mwgg/libreping/pkg/identity"
 	"github.com/mwgg/libreping/pkg/protocol"
+	"github.com/mwgg/libreping/probe/checks"
 )
 
 // fakeHub records submissions and serves a fixed catalog.
@@ -92,5 +93,41 @@ func TestRateLimiterUnlimitedWhenZero(t *testing.T) {
 		if !b.allow() {
 			t.Fatal("unlimited limiter denied an execution")
 		}
+	}
+}
+
+func TestUnsupportedHTTPConnectEmitsNoResult(t *testing.T) {
+	id, _ := identity.Generate()
+	hub := &fakeHub{}
+	r := New(Config{Identity: id, Hub: hub})
+	r.registry = new(checks.Registry) // Simulate a legacy binary without the checker.
+	r.execute(context.Background(), protocol.CheckSpec{ID: "pinned", Type: protocol.CheckHTTPConnect, Target: "https://example.com", Params: map[string]string{"connect_address": "192.0.2.1"}})
+	if len(hub.results) != 0 {
+		t.Fatal("unsupported type emitted a result")
+	}
+}
+
+func TestHTTPConnectReporterPreservesWireIdentity(t *testing.T) {
+	id, _ := identity.Generate()
+	hub := &fakeHub{}
+	r := New(Config{Identity: id, Hub: hub})
+	found := false
+	for _, kind := range r.supported {
+		if kind == protocol.CheckHTTPConnect {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("new checker not advertised")
+	}
+	spec := protocol.CheckSpec{Type: protocol.CheckHTTPConnect, Target: "https://example.com", Params: map[string]string{"connect_address": "invalid"}}
+	spec.ID = spec.DeriveID()
+	r.execute(context.Background(), spec)
+	if len(hub.results) != 1 {
+		t.Fatal("missing result")
+	}
+	got := hub.results[0]
+	if got.Verify() != nil || got.Content.CheckID != spec.ID || got.Content.CheckType != spec.Type || got.Content.Target != spec.Target {
+		t.Fatalf("wrong result: %+v", got)
 	}
 }

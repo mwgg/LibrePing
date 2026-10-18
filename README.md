@@ -300,15 +300,38 @@ if your host can't grant the `NET_RAW` capability those checks need.
 | Check       | What it tells you                              | Needs extra setup |
 |-------------|------------------------------------------------|-------------------|
 | HTTP(S)     | Is the site up? How fast? Right content?       | no                |
+| HTTP connect | HTTP(S) vhost health through a specific IP | no                |
 | TCP         | Is a port reachable?                           | no                |
 | DNS         | Does the name resolve to the right answer?     | no                |
 | TLS         | Is the certificate valid / about to expire?    | no                |
 | ICMP ping   | Latency and packet loss                        | `NET_RAW` capability |
 | Traceroute  | The network path and where it breaks           | `NET_RAW` capability |
 
-> All six checks are implemented. ICMP and traceroute need raw sockets — the
+> All check types are implemented. ICMP and traceroute need raw sockets — the
 > probe auto-detects this and simply doesn't offer them where the `NET_RAW`
 > capability isn't granted.
+
+`http_connect` is an additive API check type for testing a particular backend:
+
+```json
+{"type":"http_connect","target":"https://example.com/health","params":{"connect_address":"192.0.2.10","expect_status":"200"}}
+```
+
+The required `connect_address` is a canonical literal IPv4 or IPv6 address
+(lowercase compressed IPv6, no brackets, zone, CIDR or port). The URL supplies
+the port, HTTP Host and TLS SNI/certificate name. TLS uses system roots; there
+is no certificate-verification bypass. The probe applies its target policy to
+the backend IP and never falls back to resolving the URL hostname. Redirects
+are returned as responses, never followed; use `expect_status` to require a
+specific status. All existing HTTP parameters retain their meanings. Ordinary
+`http` checks keep following redirects and ignore `connect_address` as before.
+
+Different backend addresses have different check IDs. Upgrade hubs and probes
+before relying on this type: upgraded hubs assign it only to probes explicitly
+advertising `http_connect`, including when a legacy probe declares no types.
+Older probes skip an unknown type without producing results. Catalog creation
+alone does not prove probe coverage; verify capable registrations, assignments
+and actual results before enabling dependent monitoring.
 
 ---
 

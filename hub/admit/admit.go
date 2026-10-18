@@ -129,6 +129,9 @@ func Result(ctx context.Context, catalog CatalogLookup, sr protocol.SignedResult
 // the payload without affecting any legitimate DeriveID input. Callers apply it
 // on the create path and on mesh catalog ingest so both hold to one standard.
 func Spec(s protocol.CheckSpec) error {
+	if err := s.ValidateHTTPConnect(); err != nil {
+		return err
+	}
 	if len(s.Target) > maxTargetLen {
 		return fmt.Errorf("%w: target", ErrSpecOversized)
 	}
