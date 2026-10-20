@@ -37,7 +37,16 @@ HTTPS calls to a hub. A hub is a peer in the mesh, so it should be publicly
 reachable: ideally a domain with TLS for its HTTP side, and an open TCP port for
 the libp2p mesh.
 
-Both ship as Docker images and build from the repo root.
+Both ship as prebuilt multi-arch Docker images on GitHub Container Registry
+(`ghcr.io/mwgg/libreping-{hub,probe,web}`, amd64 + arm64, the probe also
+`arm/v7`), so you don't need to clone or build anything. You need Docker with
+Compose v2.24+ (for the optional `.env` the compose files read).
+
+**Versions.** The compose files pull `:latest`, which is the newest tagged
+release. To pin one, set `LIBREPING_VERSION=0.3.0` (any published `X.Y.Z` or
+`X.Y`) in `.env`; `:edge` tracks `main`. Update with
+`docker compose pull && docker compose up -d`. Keep the `/data` volumes across
+updates — they hold the node's identity key.
 
 ## Required configuration for federation
 
@@ -62,11 +71,6 @@ automatically. There are two ways to give it that contact point:
 Either way you only need **one** reachable contact; the mesh takes over from
 there. See [Joining the mesh](#joining-the-mesh-required-to-federate).
 
-```bash
-git clone https://github.com/mwgg/LibrePing.git
-cd LibrePing
-```
-
 ---
 
 ## Running a probe
@@ -77,18 +81,41 @@ whichever hub it lands on, so a probe contributes to the whole network, not just
 "its" hub.
 
 ```bash
-docker compose -f docker-compose.probe.yml up -d --build
+docker run -d --name libreping-probe --restart unless-stopped \
+  -v libreping-probe:/data ghcr.io/mwgg/libreping-probe
 ```
 
 That's the whole thing — it defaults to the public network, auto-detects its
-location from its public IP, and offers every check type its host supports. To
-customise, copy the short probe env file (one meaningful line, not the full hub
-`.env.example`) and edit it:
+location from its public IP, and offers every check type its host supports.
+Pass settings with `-e` (e.g. `-e HUB_URL=https://your-hub.example`), and add
+`--cap-add NET_RAW` to enable ICMP/traceroute.
 
-```bash
-cp .env.probe.example .env
-docker compose -f docker-compose.probe.yml up -d --build
+Prefer Compose? Save this as `docker-compose.yml` and run `docker compose up -d`
+(it is the repo's [`docker-compose.probe.yml`](docker-compose.probe.yml)):
+
+```yaml
+name: libreping-probe
+
+services:
+  probe:
+    image: ghcr.io/mwgg/libreping-probe:${LIBREPING_VERSION:-latest}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HUB_URL: "${HUB_URL:-https://nl.lp.mw.gg}"
+    volumes:
+      - probedata:/data
+    # cap_add: ["NET_RAW"]   # enable for ICMP/traceroute checks
+
+volumes:
+  probedata:
 ```
+
+To customise, put settings in a `.env` next to it — start from the short
+[`.env.probe.example`](.env.probe.example) (one meaningful line, not the full hub
+`.env.example`).
 
 **A probe is not tied to one hub.** `HUB_URL` is a comma-separated list of seed
 hubs, and unless you set `HUB_DISCOVERY=false` the probe also learns other hubs
@@ -98,8 +125,8 @@ that hub is back. A single seed is enough; listing two gives an instant fallback
 before discovery runs:
 
 ```bash
-HUB_URL=https://nl.lp.mw.gg,https://your-other-hub.example \
-  docker compose -f docker-compose.probe.yml up -d --build
+# in .env
+HUB_URL=https://nl.lp.mw.gg,https://your-other-hub.example
 ```
 
 Useful knobs (full list in the [reference](#probe)):
@@ -111,8 +138,9 @@ Useful knobs (full list in the [reference](#probe)):
   traceroute need the `NET_RAW` capability; the probe auto-detects this and
   simply won't offer them when it's missing.
 
-The probe stores nothing but its identity key (`./data/probe.key`). Keep that
-file to keep the same probe identity across restarts.
+The probe stores nothing but its identity key (`/data/probe.key` in the
+container, i.e. the `probedata` volume). Keep that volume to keep the same probe
+identity across restarts and updates.
 
 ---
 
@@ -124,9 +152,16 @@ the dashboard (an nginx container that serves the UI and proxies `/api` to the
 hub), and a local probe.
 
 ```bash
-cp .env.example .env     # then edit — at minimum set PUBLIC_URL (see below)
-docker compose up -d --build
+mkdir libreping && cd libreping
+curl -fsSLO https://raw.githubusercontent.com/mwgg/LibrePing/main/docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/mwgg/LibrePing/main/.env.example -o .env
+# edit .env — at minimum set PUBLIC_URL (see below)
+docker compose up -d
 ```
+
+The compose file is self-contained ([`docker-compose.yml`](docker-compose.yml));
+every hub and local-probe setting is read from `.env`, so you never need to edit
+the compose file itself except to change published ports.
 
 - Dashboard: http://localhost:8081
 - API: http://localhost:8080
@@ -279,7 +314,7 @@ origin covers both the UI and the API — and therefore `PUBLIC_URL` /
 `/api/v1/identity` resolves through it.
 
 First, bind the published HTTP ports to localhost so only your reverse proxy can
-reach them (the mesh port stays public). In `docker-compose.yml`:
+reach them (the mesh port stays public). In your `docker-compose.yml`:
 
 ```yaml
   web:
@@ -428,6 +463,7 @@ hub-operator configuration** — there is nothing to set up to enable them.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `LIBREPING_VERSION` | `latest` | Image tag the compose files pull (`X.Y.Z`, `X.Y`, `latest`, or `edge` for `main`). Compose-level, read from `.env`. |
 | `HUB_KEY_PATH` | `./data/hub.key` | Ed25519 identity key file. Keep it to keep the same hub ID (and libp2p PeerID). |
 | `MIGRATIONS_DIR` | `./migrations` | Directory of SQL migrations applied on startup. |
 | `CATALOG_GOSSIP_INTERVAL` | `1m` | Anti-entropy re-broadcast interval for catalog/subscriptions/alerts. |

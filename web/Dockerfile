@@ -1,5 +1,6 @@
 # Build context is the repo ROOT (consistent with the other services).
-FROM node:22-alpine AS build
+# The bundle is platform-independent, so build it natively for every target.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS build
 WORKDIR /app
 COPY web/package.json web/package-lock.json ./
 RUN npm ci

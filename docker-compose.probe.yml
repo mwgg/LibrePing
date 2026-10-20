@@ -1,27 +1,21 @@
-# PROBE-only node: contribute a vantage point to a hub someone else is running,
-# without hosting a hub or database yourself.
+# PROBE-only node: contribute a vantage point to the network without hosting a
+# hub or database. Self-contained — copy it anywhere and run:
 #
-# Zero config — it defaults to the public network:
-#   docker compose -f docker-compose.probe.yml up -d --build
+#   docker compose -f docker-compose.probe.yml up -d
 #
-# To customise (location, your own hub, etc.), copy the probe env example first:
-#   cp .env.probe.example .env   # then edit
+# Zero config: it defaults to the public network. To customise (location, your
+# own hub, …) put settings in an optional .env (see .env.probe.example).
 name: libreping-probe
 
 services:
   probe:
-    build:
-      context: .
-      dockerfile: probe/Dockerfile
+    image: ghcr.io/mwgg/libreping-probe:${LIBREPING_VERSION:-latest}
     restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
     environment:
       HUB_URL: "${HUB_URL:-https://nl.lp.mw.gg}"
-      PROBE_LOCATION: "${PROBE_LOCATION:-}"
-      PROBE_GEOIP: "${PROBE_GEOIP:-true}"
-      MAX_CHECKS_PER_MINUTE: "${MAX_CHECKS_PER_MINUTE:-300}"
-      DISABLE_CHECKS: "${DISABLE_CHECKS:-}"
-      PROBE_KEY_PATH: "/data/probe.key"
-      POLL_INTERVAL: "${POLL_INTERVAL:-60s}"
     volumes:
       - probedata:/data
     # cap_add: ["NET_RAW"]   # enable for ICMP/traceroute checks

@@ -177,7 +177,11 @@ A `2xx` response is treated as delivered; anything else is retried.
 
 ## Quick start (run infrastructure)
 
-You need [Docker](https://docs.docker.com/get-docker/) installed. That's it.
+You need [Docker](https://docs.docker.com/get-docker/) with Compose v2.24+.
+No clone, no build: prebuilt multi-arch images (amd64, arm64; the probe also
+32-bit ARM) are published to GitHub Container Registry as
+`ghcr.io/mwgg/libreping-hub`, `ghcr.io/mwgg/libreping-probe` and
+`ghcr.io/mwgg/libreping-web`.
 
 > For the full walkthrough — putting a hub behind nginx/Caddy with a domain and
 > TLS, opening the libp2p mesh/DHT port, and a reference for **every** `.env`
@@ -186,11 +190,18 @@ You need [Docker](https://docs.docker.com/get-docker/) installed. That's it.
 
 ### Option A — Run a full Hub (dashboard + database + a local probe)
 
+Grab the compose file into an empty directory and start it:
+
 ```bash
-git clone https://github.com/mwgg/LibrePing.git
-cd LibrePing
-docker compose up -d --build
+mkdir libreping && cd libreping
+curl -fsSLO https://raw.githubusercontent.com/mwgg/LibrePing/main/docker-compose.yml
+docker compose up -d
 ```
+
+That's the whole install: the hub, its TimescaleDB database, the dashboard and a
+local probe. Settings go in an optional `.env` next to the compose file (see
+[`.env.example`](./.env.example)); a public hub should at least set
+`PUBLIC_URL`. Update with `docker compose pull && docker compose up -d`.
 
 Then open **http://localhost:8081** in your browser. You'll see the world map;
 within a minute the local probe reports its first check and a dot appears.
@@ -202,7 +213,7 @@ To **federate with other hubs** a hub needs one contact point into the mesh; the
 shipped `docker-compose.yml` already sets `BOOTSTRAP_SEEDS` to community hubs, so
 a fresh hub **auto-joins** — it fetches a live, self-maintaining peer list from
 those seeds' `/api/v1/hubs` and dials in. To pin specific peers instead, set
-`BOOTSTRAP_PEERS` in a `.env` file (copy `.env.example` first); your hub prints
+`BOOTSTRAP_PEERS` in your `.env`; your hub prints
 its own address on startup (look for `p2p mesh listening`). Once connected to at
 least one peer, hubs also discover each other through the DHT over time. A hub
 with `PUBLIC_URL` (and a public `P2P_ANNOUNCE_ADDRS`) advertises itself so it
@@ -240,19 +251,30 @@ measurements gossip out to every hub from there. It needs no configuration: it
 defaults to the public network, so this is the whole thing:
 
 ```bash
-git clone https://github.com/mwgg/LibrePing.git
-cd LibrePing
-docker compose -f docker-compose.probe.yml up -d --build
+docker run -d --name libreping-probe --restart unless-stopped \
+  -v libreping-probe:/data ghcr.io/mwgg/libreping-probe
 ```
 
-To point it at your own hub or set a location, copy the short probe env file
-(`cp .env.probe.example .env`, then edit) — it's one meaningful line, unlike the
-full hub `.env.example`. Or just pass `HUB_URL` inline:
+Or, as a `docker-compose.yml` (then `docker compose up -d`):
 
-```bash
-HUB_URL=https://your-hub.example \
-  docker compose -f docker-compose.probe.yml up -d --build
+```yaml
+services:
+  probe:
+    image: ghcr.io/mwgg/libreping-probe:latest
+    restart: unless-stopped
+    environment:
+      HUB_URL: https://nl.lp.mw.gg   # or your own hub
+      # PROBE_LOCATION: "US,New York,40.71,-74.01"   # override IP-based location
+    volumes:
+      - probedata:/data              # keeps the probe's identity key
+    # cap_add: ["NET_RAW"]           # enable for ICMP/traceroute checks
+
+volumes:
+  probedata:
 ```
+
+Any variable from the [probe reference](./SELF_HOSTING.md#probe) goes under
+`environment:` (or `-e` for `docker run`).
 
 **A probe is never tied to a single hub.** `HUB_URL` is a comma-separated list
 of seed hubs, and unless you set `HUB_DISCOVERY=false` the probe also **learns
@@ -266,9 +288,9 @@ network-wide, it reaches your home hub either way. So a single entry point is
 enough to be resilient, and listing a couple of hubs gives an immediate fallback
 even before discovery kicks in:
 
-```bash
-HUB_URL=https://nl.lp.mw.gg,https://your-other-hub.example \
-  docker compose -f docker-compose.probe.yml up -d --build
+```yaml
+    environment:
+      HUB_URL: https://nl.lp.mw.gg,https://your-other-hub.example
 ```
 
 By default the probe **detects its own location from its public IP** (free,
@@ -464,10 +486,17 @@ probe share a `pkg/` module (`identity` for the Ed25519 signing/trust core,
 (evaluation + delivery), and `encbox` (sealed alert destinations). Quick version:
 
 ```bash
-make build   # build all Go modules
-make test    # run all tests, including the peer-to-peer gossip integration test
-make web     # build the dashboard
+make build     # build all Go modules
+make test      # run all tests, including the peer-to-peer gossip integration test
+make web       # build the dashboard
+make up        # run a full hub node built from your checkout
+make probe-up  # run a probe-only node built from your checkout
 ```
+
+`make up`/`make probe-up` layer `docker-compose.build.yml` over the compose
+files so the images are built locally instead of pulled. Images are published
+by `.github/workflows/images.yml`: every push to `main` updates the `:edge`
+tag, and a `vX.Y.Z` tag publishes `:X.Y.Z`, `:X.Y` and `:latest`.
 
 ## License
 

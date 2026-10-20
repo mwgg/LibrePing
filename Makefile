@@ -38,13 +38,13 @@ tidy:
 web:
 	cd web && npm install && npm run build
 
-## up: run a full hub node (hub + db + dashboard + local probe)
+## up: run a full hub node (hub + db + dashboard + local probe) built from this checkout
 up:
-	docker compose up -d --build
+	docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
-## probe-up: run a probe-only node (set HUB_URL)
+## probe-up: run a probe-only node built from this checkout (set HUB_URL)
 probe-up:
-	docker compose -f docker-compose.probe.yml up -d --build
+	docker compose -f docker-compose.probe.yml -f docker-compose.build.yml up -d --build probe
 
 ## down: stop and remove the local stack
 down:

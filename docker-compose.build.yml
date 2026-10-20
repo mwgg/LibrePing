@@ -1,0 +1,14 @@
+# Development override: build the images from this checkout instead of pulling
+# the published ones. Layer it over either node file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#   docker compose -f docker-compose.probe.yml -f docker-compose.build.yml up -d --build probe
+#
+# (`make up` / `make probe-up` do exactly this.)
+services:
+  hub:
+    build: { context: ., dockerfile: hub/Dockerfile }
+  web:
+    build: { context: ., dockerfile: web/Dockerfile }
+  probe:
+    build: { context: ., dockerfile: probe/Dockerfile }

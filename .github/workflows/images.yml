@@ -1,0 +1,65 @@
+name: Images
+
+# Publishes the hub, probe and web images to GHCR.
+#   push to main  -> :edge, :sha-<short>
+#   tag vX.Y.Z    -> :X.Y.Z, :X.Y, :latest  (what the compose files pull)
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "**/Dockerfile"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: hub
+            platforms: linux/amd64,linux/arm64
+          # 32-bit ARM too: a probe is the thing people run on a spare Pi.
+          - name: probe
+            platforms: linux/amd64,linux/arm64,linux/arm/v7
+          - name: web
+            platforms: linux/amd64,linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/libreping-${{ matrix.name }}
+          tags: |
+            type=edge,branch=main
+            type=sha,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          flavor: |
+            latest=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=libreping-${{ matrix.name }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.name }}/Dockerfile
+          platforms: ${{ matrix.platforms }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
