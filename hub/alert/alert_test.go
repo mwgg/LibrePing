@@ -255,6 +255,90 @@ func TestStaleDownDoesNotFire(t *testing.T) {
 	}
 }
 
+func TestCorroboratedStatus(t *testing.T) {
+	freshDown := protocol.ResultContent{Status: protocol.StatusDown, TimestampMS: testNowMS}
+	freshUp := protocol.ResultContent{Status: protocol.StatusUp, TimestampMS: testNowMS}
+	staleUp := protocol.ResultContent{Status: protocol.StatusUp, TimestampMS: testNowMS - downRecencyMS - 1}
+	staleDown := protocol.ResultContent{Status: protocol.StatusDown, TimestampMS: testNowMS - downRecencyMS - 1}
+	degraded := protocol.ResultContent{Status: protocol.StatusDegraded, TimestampMS: testNowMS}
+	graceUp := protocol.ResultContent{Status: protocol.StatusUp, TimestampMS: testNowMS - 120_000}
+	tests := []struct {
+		name          string
+		observations  []protocol.ResultContent
+		failLocations int
+		forSeconds    int
+		want          protocol.Status
+		wantOK        bool
+	}{
+		{name: "no observations", failLocations: 2},
+		{name: "one remaining down", observations: []protocol.ResultContent{freshDown, staleDown}, failLocations: 2},
+		{name: "degraded only", observations: []protocol.ResultContent{degraded}, failLocations: 2},
+		{name: "stale up and fresh down", observations: []protocol.ResultContent{staleUp, freshDown}, failLocations: 2},
+		{name: "all stale", observations: []protocol.ResultContent{staleUp, staleDown}, failLocations: 2},
+		{name: "fresh up", observations: []protocol.ResultContent{freshUp}, failLocations: 2, want: protocol.StatusUp, wantOK: true},
+		{name: "fresh up below quorum", observations: []protocol.ResultContent{freshUp, freshDown}, failLocations: 2, want: protocol.StatusUp, wantOK: true},
+		{name: "down quorum", observations: []protocol.ResultContent{freshDown, freshDown}, failLocations: 2, want: protocol.StatusDown, wantOK: true},
+		{name: "default quorum", observations: []protocol.ResultContent{freshDown}, want: protocol.StatusDown, wantOK: true},
+		{name: "up within grace", observations: []protocol.ResultContent{freshDown, freshDown, freshUp}, failLocations: 2, forSeconds: 120, want: protocol.StatusUp, wantOK: true},
+		{name: "up at grace boundary", observations: []protocol.ResultContent{freshDown, freshDown, graceUp}, failLocations: 2, forSeconds: 120, want: protocol.StatusDown, wantOK: true},
+		{name: "zero grace", observations: []protocol.ResultContent{freshDown, freshDown, freshUp}, failLocations: 2, want: protocol.StatusDown, wantOK: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			latest := make(map[string]protocol.ResultContent, len(tt.observations))
+			for i, c := range tt.observations {
+				latest[fmt.Sprint(i)] = c
+			}
+			got, ok := corroboratedStatus(latest, tt.failLocations, tt.forSeconds, testNowMS)
+			if got != tt.want || ok != tt.wantOK {
+				t.Fatalf("corroboratedStatus = (%q, %v), want (%q, %v)", got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestEngineRetainsDownUntilFreshUp(t *testing.T) {
+	ctx := context.Background()
+	nf := &flakyNotifier{}
+	eng, alerts, results, rule := engineFixture(t, nf)
+	now := testNowMS
+	eng.now = func() time.Time { return time.UnixMilli(now) }
+	steps := []struct {
+		name    string
+		now     int64
+		results []protocol.SignedResult
+		count   int
+		status  protocol.Status
+	}{
+		{"down", testNowMS, []protocol.SignedResult{downResult("chk", "pa", testNowMS-1000), downResult("chk", "pb", testNowMS)}, 1, protocol.StatusDown},
+		{"partial stale", testNowMS + downRecencyMS, nil, 1, protocol.StatusDown},
+		{"all stale", testNowMS + downRecencyMS + 1, nil, 1, protocol.StatusDown},
+		{"fresh down", testNowMS + 3_600_000, []protocol.SignedResult{downResult("chk", "pa", testNowMS+3_600_000), downResult("chk", "pb", testNowMS+3_600_000)}, 1, protocol.StatusDown},
+		{"actual up", testNowMS + 3_601_000, []protocol.SignedResult{upResult("chk", "pa", testNowMS+3_601_000)}, 2, protocol.StatusUp},
+	}
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			now = step.now
+			for _, sr := range step.results {
+				if err := results.Insert(ctx, sr); err != nil {
+					t.Fatal(err)
+				}
+			}
+			eng.Evaluate(ctx)
+			if nf.count() != step.count {
+				t.Errorf("got %d notifications, want %d", nf.count(), step.count)
+			}
+			delivery, ok, err := alerts.GetDeliveryBy(ctx, rule.ID(), eng.self)
+			if err != nil || !ok || delivery.Status != step.status {
+				t.Fatalf("delivery = %+v, %v, %v; want status %q", delivery, ok, err, step.status)
+			}
+			if step.status == protocol.StatusDown && delivery.TimestampMS != testNowMS {
+				t.Errorf("down delivery timestamp changed: got %d, want %d", delivery.TimestampMS, testNowMS)
+			}
+		})
+	}
+}
+
 func TestEngineRetriesThenDeliversOnceThenRecovers(t *testing.T) {
 	ctx := context.Background()
 	nf := &flakyNotifier{fail: true}

@@ -175,6 +175,10 @@ your sealed destination is never echoed in the body):
 
 A `2xx` response is treated as delivered; anything else is retried.
 
+Recovery requires an actual fresh `up` observation when the down condition is
+not corroborated. Losing the failure quorum is not recovery: stale, missing,
+or degraded-only observations leave the last delivered status unchanged.
+
 ## Quick start (run infrastructure)
 
 You need [Docker](https://docs.docker.com/get-docker/) with Compose v2.24+.

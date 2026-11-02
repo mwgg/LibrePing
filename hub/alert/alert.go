@@ -148,7 +148,7 @@ func (e *Engine) Evaluate(ctx context.Context) {
 		latest := latestFor(rule.CheckID)
 		observed, ok := corroboratedStatus(latest, rule.FailLocations, rule.ForSeconds, now)
 		if !ok {
-			continue // no fresh data yet
+			continue // neither corroborated down nor a fresh up
 		}
 		// Own-observation guard: skip only when our OWN corroborated observation
 		// matches what THIS responsible hub last successfully delivered. `observed`
@@ -300,9 +300,8 @@ func recencyMS(forSeconds int) int64 {
 
 // corroboratedStatus decides a check's status from the latest result per probe.
 // Only observations within the recency window (recencyMS(forSeconds)) count, so
-// a silent fleet asserts neither state — it reads as "no fresh data" and the
-// rule is skipped, leaving the last delivered status untouched. This gives the
-// "down" side the same freshness guarantee the "up" side already had.
+// recovery requires an actual fresh up, not merely loss of the down quorum.
+// Without either decision the rule is skipped, leaving delivery state untouched.
 func corroboratedStatus(latest map[string]protocol.ResultContent, failLocations, forSeconds int, nowMS int64) (protocol.Status, bool) {
 	if failLocations < 1 {
 		failLocations = 1
@@ -310,12 +309,10 @@ func corroboratedStatus(latest map[string]protocol.ResultContent, failLocations,
 	recency := recencyMS(forSeconds)
 	down := 0
 	var newestUp int64
-	fresh := false
 	for _, c := range latest {
 		if nowMS-c.TimestampMS > recency {
 			continue // stale: cannot assert up or down
 		}
-		fresh = true
 		switch c.Status {
 		case protocol.StatusDown:
 			down++
@@ -325,12 +322,12 @@ func corroboratedStatus(latest map[string]protocol.ResultContent, failLocations,
 			}
 		}
 	}
-	if !fresh {
-		return "", false
-	}
 	downCorroborated := down >= failLocations && (newestUp == 0 || nowMS-newestUp >= int64(forSeconds)*1000)
 	if downCorroborated {
 		return protocol.StatusDown, true
 	}
-	return protocol.StatusUp, true
+	if newestUp != 0 {
+		return protocol.StatusUp, true
+	}
+	return "", false
 }
